@@ -33,7 +33,6 @@ def _get_state_class(entity: dict[str, object] | None) -> str | None:
 def run_entity_analysis(
     *,
     storage_dir: Path,
-    entity_registry_file: Path | None,
     old_entity_id: str,
     new_entity_id: str,
     tick: str,
@@ -42,10 +41,7 @@ def run_entity_analysis(
     print("*** Stage 1: Entity analysis")
 
     try:
-        registry: EntityRegistry = load_entity_registry(
-            storage_dir=storage_dir,
-            entity_registry_file=entity_registry_file,
-        )
+        registry: EntityRegistry = load_entity_registry(storage_dir=storage_dir)
     except EntityRegistryError as exc:
         raise SystemExit(str(exc))
 

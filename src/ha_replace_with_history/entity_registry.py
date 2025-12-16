@@ -16,19 +16,11 @@ class EntityRegistryError(RuntimeError):
     pass
 
 
-def load_entity_registry(*, storage_dir: Path, entity_registry_file: Path | None = None) -> EntityRegistry:
-    """Load Home Assistant entity registry from `.storage/core.entity_registry` (or override).
-
-    `entity_registry_file` may be absolute or relative; if relative, it is resolved relative to `storage_dir`.
-    """
+def load_entity_registry(*, storage_dir: Path) -> EntityRegistry:
+    """Load Home Assistant entity registry from `<storage_dir>/core.entity_registry`."""
     storage_dir = storage_dir.expanduser()
 
-    if entity_registry_file is None:
-        registry_path = storage_dir / "core.entity_registry"
-    else:
-        registry_path = entity_registry_file.expanduser()
-        if not registry_path.is_absolute():
-            registry_path = storage_dir / registry_path
+    registry_path = storage_dir / "core.entity_registry"
 
     try:
         raw = registry_path.read_text(encoding="utf-8")

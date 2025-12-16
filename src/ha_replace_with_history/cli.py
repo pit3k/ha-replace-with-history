@@ -31,14 +31,6 @@ def build_parser() -> argparse.ArgumentParser:
         default="./.storage/",
         help="Path to Home Assistant storage dir (default: ./.storage/).",
     )
-    p.add_argument(
-        "--entity-registry-file",
-        default=None,
-        help=(
-            "Override path to entity registry file. If relative, it's resolved relative to --storage. "
-            "Default: <storage>/core.entity_registry"
-        ),
-    )
 
     def parse_bool(value: str) -> bool:
         v = value.strip().lower()
@@ -78,7 +70,6 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
     storage_dir = Path(args.storage)
-    entity_registry_file = Path(args.entity_registry_file) if args.entity_registry_file else None
 
     tick = "✓"
     encoding = sys.stdout.encoding or "utf-8"
@@ -94,7 +85,6 @@ def main(argv: list[str] | None = None) -> int:
 
     stage1 = run_entity_analysis(
         storage_dir=storage_dir,
-        entity_registry_file=entity_registry_file,
         old_entity_id=args.old_entity_id,
         new_entity_id=args.new_entity_id,
         tick=tick,

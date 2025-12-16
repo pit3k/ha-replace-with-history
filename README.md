@@ -20,12 +20,6 @@ Include DB summary (default DB path is `./home-assistant_v2.db`):
 python -m ha_replace_with_history --db .\home-assistant_v2.db --storage .\.storage sensor.sun_next_dawn sensor.sun_next_dusk
 ```
 
-Override registry file path (relative to `--storage`, or absolute):
-
-```powershell
-python -m ha_replace_with_history --storage .\.storage --entity-registry-file core.entity_registry sensor.sun_next_dawn sensor.sun_next_dusk
-```
-
 Install editable + run console script:
 
 ```powershell
