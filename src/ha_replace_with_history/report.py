@@ -245,18 +245,34 @@ def render_simple_table(
     color: bool = False,
     color_code: str = "31",
 ) -> str:
+    def _split_cell(text: str) -> list[str]:
+        parts = text.split("\n")
+        return parts if parts else [""]
+
     widths = [len(h) for h in headers]
     for r in rows:
         for i, c in enumerate(r):
-            widths[i] = max(widths[i], len(c))
+            widths[i] = max(widths[i], max((len(p) for p in _split_cell(c)), default=0))
 
     def fmt_row(cols: list[str]) -> str:
         return " | ".join(cols[i].ljust(widths[i]) for i in range(len(headers))).rstrip()
 
+    def fmt_row_multiline(cols: list[str]) -> list[str]:
+        col_lines = [_split_cell(c) for c in cols]
+        height = max(len(x) for x in col_lines)
+        out: list[str] = []
+        for line_idx in range(height):
+            physical = [
+                (col_lines[col_idx][line_idx] if line_idx < len(col_lines[col_idx]) else "")
+                for col_idx in range(len(headers))
+            ]
+            out.append(fmt_row(physical))
+        return out
+
     lines = [fmt_row(headers), fmt_row(["-" * w for w in widths])]
     for r in rows:
-        line = fmt_row(r)
+        physical_lines = fmt_row_multiline(r)
         if color:
-            line = f"\x1b[{color_code}m{line}\x1b[0m"
-        lines.append(line)
+            physical_lines = [f"\x1b[{color_code}m{ln}\x1b[0m" for ln in physical_lines]
+        lines.extend(physical_lines)
     return "\n".join(lines) + "\n"

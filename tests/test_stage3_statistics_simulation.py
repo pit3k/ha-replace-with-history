@@ -81,7 +81,12 @@ class TestStage3StatisticsSimulation(unittest.TestCase):
             )
 
             # Simulated resets should be none for this data.
-            resets = collect_reset_events_statistics(ro, "statistics_generated", "sensor.new")
+            resets = collect_reset_events_statistics(
+                ro,
+                "statistics_generated",
+                "sensor.new",
+                state_class="total_increasing",
+            )
             self.assertEqual(resets, [])
 
             # Gap should be detected between 3600 and 10800 (missing one 7200 row).
@@ -93,7 +98,7 @@ class TestStage3StatisticsSimulation(unittest.TestCase):
             self.assertEqual(gaps[0]["table"], "statistics_generated")
             self.assertEqual(
                 gaps[0]["gap"],
-                f"{self._fmt_local(3600.0)} (20.0/110.0) - {self._fmt_local(10800.0)} (31.0/111.0) [1 rows]",
+                f"{self._fmt_local(3600.0)} - {self._fmt_local(10800.0)} [1 rows]\n20.0/110.0 - 31.0/111.0",
             )
         finally:
             ro.close()

@@ -15,8 +15,8 @@ def run_statistics_analysis(
     *,
     old_entity_id: str,
     new_entity_id: str,
-    old_total_like: bool,
-    new_total_like: bool,
+    old_state_class: str | None,
+    new_state_class: str | None,
     old_summary: dict[str, object],
     new_summary: dict[str, object],
     tick: str,
@@ -42,19 +42,30 @@ def run_statistics_analysis(
     print(stats_report, end="")
 
     # Reset events apply to total-like sensors (total_increasing and total).
+    old_total_like = old_state_class in {"total_increasing", "total"}
+    new_total_like = new_state_class in {"total_increasing", "total"}
+
     state_reset_rows: list[dict[str, str]] = []
     if old_total_like:
-        state_reset_rows.extend(collect_reset_events_states(conn, old_entity_id))
+        state_reset_rows.extend(collect_reset_events_states(conn, old_entity_id, state_class=old_state_class))
     if new_total_like:
-        state_reset_rows.extend(collect_reset_events_states(conn, new_entity_id))
+        state_reset_rows.extend(collect_reset_events_states(conn, new_entity_id, state_class=new_state_class))
 
     stats_reset_rows: list[dict[str, str]] = []
     if old_total_like:
-        stats_reset_rows.extend(collect_reset_events_statistics(conn, "statistics", old_entity_id))
-        stats_reset_rows.extend(collect_reset_events_statistics(conn, "statistics_short_term", old_entity_id))
+        stats_reset_rows.extend(
+            collect_reset_events_statistics(conn, "statistics", old_entity_id, state_class=old_state_class)
+        )
+        stats_reset_rows.extend(
+            collect_reset_events_statistics(conn, "statistics_short_term", old_entity_id, state_class=old_state_class)
+        )
     if new_total_like:
-        stats_reset_rows.extend(collect_reset_events_statistics(conn, "statistics", new_entity_id))
-        stats_reset_rows.extend(collect_reset_events_statistics(conn, "statistics_short_term", new_entity_id))
+        stats_reset_rows.extend(
+            collect_reset_events_statistics(conn, "statistics", new_entity_id, state_class=new_state_class)
+        )
+        stats_reset_rows.extend(
+            collect_reset_events_statistics(conn, "statistics_short_term", new_entity_id, state_class=new_state_class)
+        )
 
     # Print two combined reset tables:
     # 1) states + statistics
@@ -63,16 +74,37 @@ def run_statistics_analysis(
         stats_rows = [r for r in stats_reset_rows if r.get("table") == "statistics"]
         st_rows = [r for r in stats_reset_rows if r.get("table") == "statistics_short_term"]
 
+        def split_ts_val(cell: str) -> tuple[str, str]:
+            if not cell:
+                return "", ""
+            if cell.endswith(")") and " (" in cell:
+                ts, val = cell.rsplit(" (", 1)
+                return ts, val[:-1]
+            return cell, ""
+
+        def range_cell(before: str, after: str) -> str:
+            before_ts, before_val = split_ts_val(before)
+            after_ts, after_val = split_ts_val(after)
+            ts_line = f"{before_ts} - {after_ts}".strip()
+            val_line = "" if (before_val == "" and after_val == "") else f"{before_val} - {after_val}"
+            return ts_line if not val_line else f"{ts_line}\n{val_line}"
+
         def print_combined(title: str, combined: list[dict[str, str]]) -> None:
             if not combined:
                 return
             print(title)
             combined.sort(key=lambda r: float(r.get("event_epoch", "inf") or "inf"))
-            headers = ["entity", "table", "before", "after", "last_reset"]
-            rows = [
-                [r["entity"], r["table"], r["before"], r["after"], r.get("last_reset", "")]
-                for r in combined
-            ]
+            headers = ["entity", "table", "range", "last_reset"]
+            rows: list[list[str]] = []
+            for r in combined:
+                rows.append(
+                    [
+                        r.get("entity", ""),
+                        r.get("table", ""),
+                        range_cell(r.get("before", ""), r.get("after", "")),
+                        r.get("last_reset", ""),
+                    ]
+                )
             print(render_simple_table(headers=headers, rows=rows, color=color, color_code="35"), end="")
 
         print_combined(

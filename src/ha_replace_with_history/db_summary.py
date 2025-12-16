@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -688,7 +689,9 @@ def collect_missing_statistics_row_ranges(
     - statistics: 1 hour
     - statistics_short_term: 5 minutes
 
-    Reports gaps as: `before_ts (state/sum) - after_ts (state/sum) [N rows]`.
+    Reports gaps as a two-line cell:
+    - `before_ts - after_ts [N rows]`
+    - `before_value(/sum) - after_value(/sum)`
     """
     if not _table_exists(conn, table):
         return []
@@ -771,12 +774,16 @@ def collect_missing_statistics_row_ranges(
                     after_ts = _fmt_ts(r["ts"], assume_seconds=ts_is_seconds) or ""
                     before_val = fmt_state_sum(prev_state, prev_sum)
                     after_val = fmt_state_sum(r["state"], r["sum"])
+
+                    ts_line = f"{before_ts} - {after_ts} [{missing} rows]"
+                    val_line = "" if (before_val == "" and after_val == "") else f"{before_val} - {after_val}"
+                    gap = ts_line if not val_line else f"{ts_line}\n{val_line}"
                     out.append(
                         {
                             "entity": statistic_id,
                             "table": table,
                             "gap_start_epoch": str(prev_epoch),
-                            "gap": f"{before_ts} ({before_val}) - {after_ts} ({after_val}) [{missing} rows]",
+                            "gap": gap,
                         }
                     )
 
@@ -1313,8 +1320,17 @@ def collect_generated_statistics_preview_rows(
     return out
 
 
-def collect_reset_events_states(conn: sqlite3.Connection, entity_id: str) -> list[dict[str, str]]:
-    """Reset events where numeric `state` decreases compared to the previous row."""
+def collect_reset_events_states(
+    conn: sqlite3.Connection,
+    entity_id: str,
+    *,
+    state_class: str | None = None,
+) -> list[dict[str, str]]:
+    """Collect reset events from `states`.
+
+    - For `total_increasing`: reset when numeric state drops by >10% (HA: new < 0.9 * old).
+    - For `total`: reset when `last_reset` attribute changes (HA: last_reset != old_last_reset).
+    """
     if not _table_exists(conn, "states"):
         return []
 
@@ -1335,8 +1351,27 @@ def collect_reset_events_states(conn: sqlite3.Connection, entity_id: str) -> lis
     else:
         return []
 
+    attrs_sel: str | None = None
+    if state_class == "total":
+        # Modern HA recorder schema stores attributes in `state_attributes` referenced by `states.attributes_id`.
+        if "attributes_id" in states_cols and _table_exists(conn, "state_attributes"):
+            sa_cols = _columns(conn, "state_attributes")
+            sa_pk = _pick_first_present(sa_cols, ["attributes_id", "id"])
+            sa_val = _pick_first_present(sa_cols, ["shared_attrs", "attributes"])
+            if sa_pk is not None and sa_val is not None:
+                from_sql = f"{from_sql} JOIN state_attributes sa ON sa.{sa_pk} = s.attributes_id"
+                attrs_sel = f"sa.{sa_val}"
+        if attrs_sel is None and "shared_attrs" in states_cols:
+            attrs_sel = "s.shared_attrs"
+        if attrs_sel is None and "attributes" in states_cols:
+            attrs_sel = "s.attributes"
+
+    select_cols = [f"s.{ts_col} AS ts", "s.state AS state"]
+    if attrs_sel is not None:
+        select_cols.append(f"{attrs_sel} AS attrs")
+
     rows = conn.execute(
-        f"SELECT s.{ts_col} AS ts, s.state AS state FROM {from_sql} WHERE {where_sql} ORDER BY s.{ts_col} ASC",
+        f"SELECT {', '.join(select_cols)} FROM {from_sql} WHERE {where_sql} ORDER BY s.{ts_col} ASC",
         params,
     ).fetchall()
 
@@ -1350,10 +1385,30 @@ def collect_reset_events_states(conn: sqlite3.Connection, entity_id: str) -> lis
             return True
         return s.lower() in ("unavailable", "unknown")
 
+    def normalize_last_reset(last_reset_s: Any) -> str | None:
+        if not isinstance(last_reset_s, str):
+            return None
+        s = last_reset_s.strip()
+        if not s:
+            return None
+        try:
+            # Handle common HA formatting: ISO8601 with optional trailing Z.
+            if s.endswith("Z"):
+                dt = datetime.fromisoformat(s[:-1] + "+00:00")
+            else:
+                dt = datetime.fromisoformat(s)
+        except Exception:
+            return None
+        if dt.tzinfo is None:
+            return None
+        return dt.astimezone(timezone.utc).isoformat()
+
     out: list[dict[str, str]] = []
     prev_num: float | None = None
     prev_raw: str | None = None
     prev_ts: str | None = None
+    prev_last_reset: str | None = None
+
     for r in rows:
         raw = r["state"]
         if is_unavailable_text(raw):
@@ -1364,30 +1419,72 @@ def collect_reset_events_states(conn: sqlite3.Connection, entity_id: str) -> lis
         except Exception:
             continue
 
-        if prev_num is not None and cur_num < prev_num:
-            cur_ts = _fmt_ts(r["ts"], assume_seconds=ts_is_seconds) or ""
-            cur_epoch = _to_epoch_seconds(r["ts"], assume_seconds=ts_is_seconds)
-            before_ts = prev_ts or ""
-            before_val = prev_raw if prev_raw is not None else ""
-            out.append(
-                {
-                    "entity": entity_id,
-                    "table": "states",
-                    "event_epoch": "" if cur_epoch is None else str(cur_epoch),
-                    "before": f"{before_ts} ({before_val})",
-                    "after": f"{cur_ts} ({str(raw)})",
-                }
-            )
+        cur_ts = _fmt_ts(r["ts"], assume_seconds=ts_is_seconds) or ""
+        cur_epoch = _to_epoch_seconds(r["ts"], assume_seconds=ts_is_seconds)
+        before_ts = prev_ts or ""
+        before_val = prev_raw if prev_raw is not None else ""
+
+        if state_class == "total":
+            attrs_raw = r["attrs"] if "attrs" in r.keys() else None
+            last_reset_norm: str | None = None
+            if isinstance(attrs_raw, str) and attrs_raw.strip():
+                try:
+                    attrs_obj = json.loads(attrs_raw)
+                except Exception:
+                    attrs_obj = None
+                if isinstance(attrs_obj, dict):
+                    last_reset_norm = normalize_last_reset(attrs_obj.get("last_reset"))
+
+            # HA considers a reset only when last_reset changes and is not None.
+            if prev_last_reset is not None and last_reset_norm is not None and last_reset_norm != prev_last_reset:
+                out.append(
+                    {
+                        "entity": entity_id,
+                        "table": "states",
+                        "event_epoch": "" if cur_epoch is None else str(cur_epoch),
+                        "last_reset": _fmt_ts(last_reset_norm, assume_seconds=False) or last_reset_norm,
+                        "before": f"{before_ts} ({before_val})",
+                        "after": f"{cur_ts} ({str(raw)})",
+                    }
+                )
+
+            if last_reset_norm is not None and prev_last_reset is None:
+                prev_last_reset = last_reset_norm
+            elif last_reset_norm is not None and prev_last_reset is not None:
+                prev_last_reset = last_reset_norm
+        else:
+            # Default to total_increasing semantics.
+            if prev_num is not None and cur_num < 0.9 * prev_num:
+                out.append(
+                    {
+                        "entity": entity_id,
+                        "table": "states",
+                        "event_epoch": "" if cur_epoch is None else str(cur_epoch),
+                        "before": f"{before_ts} ({before_val})",
+                        "after": f"{cur_ts} ({str(raw)})",
+                    }
+                )
 
         prev_num = cur_num
         prev_raw = str(raw)
-        prev_ts = _fmt_ts(r["ts"], assume_seconds=ts_is_seconds) or ""
+        prev_ts = cur_ts
 
     return out
 
 
-def collect_reset_events_statistics(conn: sqlite3.Connection, table: str, statistic_id: str) -> list[dict[str, str]]:
-    """Reset events where numeric value decreases compared to the previous row.
+def collect_reset_events_statistics(
+    conn: sqlite3.Connection,
+    table: str,
+    statistic_id: str,
+    *,
+    state_class: str | None = None,
+) -> list[dict[str, str]]:
+    """Collect reset events from statistics tables.
+
+    - For `total_increasing`: reset when preferred numeric value drops by >10% (HA: new < 0.9 * old).
+    - For `total`: reset when last_reset changes and is not null (HA: last_reset != old_last_reset).
+
+    For other cases, uses a numeric drop heuristic.
 
     Prefers `state` when present (it can show resets even when `sum` is reset-adjusted),
     else falls back to `sum`, then other numeric columns.
@@ -1435,10 +1532,17 @@ def collect_reset_events_statistics(conn: sqlite3.Connection, table: str, statis
         params,
     ).fetchall()
 
+    def fmt_last_reset(lr_val: Any) -> str:
+        if lr_val is None or last_reset_col is None:
+            return ""
+        return _fmt_ts(lr_val, assume_seconds=last_reset_col.endswith("_ts")) or str(lr_val)
+
     out: list[dict[str, str]] = []
     prev_num: float | None = None
     prev_raw: str | None = None
     prev_ts: str | None = None
+    prev_lr_key: float | str | None = None
+
     for r in rows:
         v = r["v"]
         if v is None:
@@ -1448,32 +1552,67 @@ def collect_reset_events_statistics(conn: sqlite3.Connection, table: str, statis
         except Exception:
             continue
 
-        if prev_num is not None and cur_num < prev_num:
-            cur_ts = _fmt_ts(r["ts"], assume_seconds=ts_is_seconds) or ""
-            cur_epoch = _to_epoch_seconds(r["ts"], assume_seconds=ts_is_seconds)
-            before_ts = prev_ts or ""
-            before_val = prev_raw if prev_raw is not None else ""
+        cur_ts = _fmt_ts(r["ts"], assume_seconds=ts_is_seconds) or ""
+        cur_epoch = _to_epoch_seconds(r["ts"], assume_seconds=ts_is_seconds)
+        before_ts = prev_ts or ""
+        before_val = prev_raw if prev_raw is not None else ""
+        lr_val = r["lr"]
 
-            lr_val = r["lr"]
-            if lr_val is None or last_reset_col is None:
-                last_reset = ""
+        if state_class == "total":
+            if last_reset_col is None:
+                # Without last_reset we cannot mirror HA reset detection for total.
+                prev_num = cur_num
+                prev_raw = str(v)
+                prev_ts = cur_ts
+                continue
+
+            lr_key: float | str | None
+            if lr_val is None:
+                lr_key = None
             else:
-                last_reset = _fmt_ts(lr_val, assume_seconds=last_reset_col.endswith("_ts")) or str(lr_val)
+                try:
+                    lr_key = float(lr_val)
+                except Exception:
+                    lr_key = str(lr_val)
 
-            out.append(
-                {
-                    "entity": statistic_id,
-                    "table": table,
-                    "event_epoch": "" if cur_epoch is None else str(cur_epoch),
-                    "last_reset": last_reset,
-                    "before": f"{before_ts} ({before_val})",
-                    "after": f"{cur_ts} ({str(v)})",
-                }
-            )
+            if prev_lr_key is not None and lr_key is not None and lr_key != prev_lr_key:
+                out.append(
+                    {
+                        "entity": statistic_id,
+                        "table": table,
+                        "event_epoch": "" if cur_epoch is None else str(cur_epoch),
+                        "last_reset": fmt_last_reset(lr_val),
+                        "before": f"{before_ts} ({before_val})",
+                        "after": f"{cur_ts} ({str(v)})",
+                    }
+                )
+            if lr_key is not None:
+                prev_lr_key = lr_key
+
+        else:
+            # Default to total_increasing semantics.
+            is_reset = False
+            if prev_num is not None:
+                if state_class == "total_increasing":
+                    is_reset = cur_num < 0.9 * prev_num
+                else:
+                    is_reset = cur_num < prev_num
+
+            if is_reset:
+                out.append(
+                    {
+                        "entity": statistic_id,
+                        "table": table,
+                        "event_epoch": "" if cur_epoch is None else str(cur_epoch),
+                        "last_reset": fmt_last_reset(lr_val),
+                        "before": f"{before_ts} ({before_val})",
+                        "after": f"{cur_ts} ({str(v)})",
+                    }
+                )
 
         prev_num = cur_num
         prev_raw = str(v)
-        prev_ts = _fmt_ts(r["ts"], assume_seconds=ts_is_seconds) or ""
+        prev_ts = cur_ts
 
     return out
 

@@ -251,8 +251,8 @@ class TestStage2DbSummary(unittest.TestCase):
 
         ro = connect_readonly_sqlite(db_path)
         try:
-            s_resets = collect_reset_events_states(ro, "sensor.r")
-            st_resets = collect_reset_events_statistics(ro, "statistics", "sensor.r")
+            s_resets = collect_reset_events_states(ro, "sensor.r", state_class="total_increasing")
+            st_resets = collect_reset_events_statistics(ro, "statistics", "sensor.r", state_class="total_increasing")
         finally:
             ro.close()
 
@@ -287,7 +287,7 @@ class TestStage2DbSummary(unittest.TestCase):
 
         ro = connect_readonly_sqlite(db_path)
         try:
-            resets = collect_reset_events_statistics(ro, "statistics", "sensor.r")
+            resets = collect_reset_events_statistics(ro, "statistics", "sensor.r", state_class="total_increasing")
         finally:
             ro.close()
 
@@ -318,7 +318,7 @@ class TestStage2DbSummary(unittest.TestCase):
 
         ro = connect_readonly_sqlite(db_path)
         try:
-            resets = collect_reset_events_statistics(ro, "statistics", "sensor.r")
+            resets = collect_reset_events_statistics(ro, "statistics", "sensor.r", state_class="total_increasing")
         finally:
             ro.close()
 
@@ -394,7 +394,7 @@ class TestStage2DbSummary(unittest.TestCase):
         self.assertEqual(gaps_stats[0]["table"], "statistics")
         self.assertEqual(
             gaps_stats[0]["gap"],
-            f"{self._fmt_local(2000.0)} (1.0/10.0) - {self._fmt_local(9200.0)} (3.0/30.0) [1 rows]",
+            f"{self._fmt_local(2000.0)} - {self._fmt_local(9200.0)} [1 rows]\n1.0/10.0 - 3.0/30.0",
         )
 
         self.assertEqual(len(gaps_st), 1)
@@ -402,5 +402,134 @@ class TestStage2DbSummary(unittest.TestCase):
         self.assertEqual(gaps_st[0]["table"], "statistics_short_term")
         self.assertEqual(
             gaps_st[0]["gap"],
-            f"{self._fmt_local(1000.0)} (5.0/50.0) - {self._fmt_local(1600.0)} (7.0/70.0) [1 rows]",
+            f"{self._fmt_local(1000.0)} - {self._fmt_local(1600.0)} [1 rows]\n5.0/50.0 - 7.0/70.0",
         )
+
+    def test_total_increasing_small_dip_is_not_reset(self) -> None:
+        db_path = self._make_db()
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute("CREATE TABLE states (entity_id TEXT, state TEXT, last_updated_ts REAL)")
+            conn.executemany(
+                "INSERT INTO states(entity_id, state, last_updated_ts) VALUES(?,?,?)",
+                [
+                    ("sensor.dip", "10", 100.0),
+                    ("sensor.dip", "9.5", 200.0),  # 5% dip => warn in HA, not a reset
+                    ("sensor.dip", "9.6", 300.0),
+                ],
+            )
+
+            conn.execute("CREATE TABLE statistics (statistic_id TEXT, start_ts REAL, state REAL, sum REAL)")
+            conn.executemany(
+                "INSERT INTO statistics(statistic_id, start_ts, state, sum) VALUES(?,?,?,?)",
+                [
+                    ("sensor.dip", 10.0, 10.0, 10.0),
+                    ("sensor.dip", 20.0, 9.5, 10.0),
+                ],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        ro = connect_readonly_sqlite(db_path)
+        try:
+            s_resets = collect_reset_events_states(ro, "sensor.dip", state_class="total_increasing")
+            st_resets = collect_reset_events_statistics(ro, "statistics", "sensor.dip", state_class="total_increasing")
+        finally:
+            ro.close()
+
+        self.assertEqual(s_resets, [])
+        self.assertEqual(st_resets, [])
+
+    def test_total_resets_use_last_reset_change_in_states(self) -> None:
+        db_path = self._make_db()
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute(
+                "CREATE TABLE state_attributes (attributes_id INTEGER PRIMARY KEY, shared_attrs TEXT)"
+            )
+            conn.execute(
+                "CREATE TABLE states (entity_id TEXT, state TEXT, attributes_id INTEGER, last_updated_ts REAL)"
+            )
+
+            conn.executemany(
+                "INSERT INTO state_attributes(attributes_id, shared_attrs) VALUES(?,?)",
+                [
+                    (1, '{"last_reset": "2025-01-01T00:00:00+00:00"}'),
+                    (2, '{"last_reset": "2025-02-01T00:00:00+00:00"}'),
+                    (3, '{"last_reset": "bogus"}'),
+                ],
+            )
+            conn.executemany(
+                "INSERT INTO states(entity_id, state, attributes_id, last_updated_ts) VALUES(?,?,?,?)",
+                [
+                    (
+                        "sensor.total",
+                        "100",
+                        1,
+                        100.0,
+                    ),
+                    (
+                        "sensor.total",
+                        "110",
+                        1,
+                        200.0,
+                    ),
+                    (
+                        "sensor.total",
+                        "5",
+                        2,
+                        300.0,
+                    ),
+                    (
+                        "sensor.total",
+                        "6",
+                        3,
+                        400.0,
+                    ),
+                ],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        ro = connect_readonly_sqlite(db_path)
+        try:
+            resets = collect_reset_events_states(ro, "sensor.total", state_class="total")
+        finally:
+            ro.close()
+
+        self.assertEqual(len(resets), 1)
+        self.assertEqual(resets[0]["before"], f"{self._fmt_local(200.0)} (110)")
+        self.assertEqual(resets[0]["after"], f"{self._fmt_local(300.0)} (5)")
+        self.assertIn("2025", resets[0].get("last_reset", ""))
+
+    def test_total_resets_use_last_reset_change_in_statistics(self) -> None:
+        db_path = self._make_db()
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute(
+                "CREATE TABLE statistics (statistic_id TEXT, start_ts REAL, state REAL, sum REAL, last_reset_ts REAL)"
+            )
+            conn.executemany(
+                "INSERT INTO statistics(statistic_id, start_ts, state, sum, last_reset_ts) VALUES(?,?,?,?,?)",
+                [
+                    ("sensor.total", 10.0, 100.0, 100.0, 1000.0),
+                    ("sensor.total", 20.0, 110.0, 110.0, 1000.0),
+                    ("sensor.total", 30.0, 5.0, 115.0, 2000.0),
+                ],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        ro = connect_readonly_sqlite(db_path)
+        try:
+            resets = collect_reset_events_statistics(ro, "statistics", "sensor.total", state_class="total")
+        finally:
+            ro.close()
+
+        self.assertEqual(len(resets), 1)
+        self.assertEqual(resets[0]["before"], f"{self._fmt_local(20.0)} (110.0)")
+        self.assertEqual(resets[0]["after"], f"{self._fmt_local(30.0)} (5.0)")
+        self.assertEqual(resets[0]["last_reset"], f"{self._fmt_local(2000.0)}")
