@@ -48,13 +48,18 @@ class TestStage3StatisticsSimulation(unittest.TestCase):
             )
 
             # New entity states start later, so precondition can pass.
-            # Chosen so first bucket starts at 10800, creating a gap from 3600 -> 10800.
+            # Also include an internal 1h bucket (14400) with no states; HA keeps generating
+            # stats with unchanged values from the prior bucket, so no gap should be reported
+            # inside the generated portion.
             conn.executemany(
                 "INSERT INTO states(entity_id, state, last_updated_ts) VALUES(?,?,?)",
                 [
                     ("sensor.new", "30", 11000.0),
                     ("sensor.new", "31", 11100.0),
-                    ("sensor.new", "32", 14500.0),
+                    # next complete bucket with a state
+                    ("sensor.new", "40", 18100.0),
+                    # state in the cutoff (in-progress) bucket so 18000 is included
+                    ("sensor.new", "41", 22000.0),
                 ],
             )
             conn.commit()
@@ -89,7 +94,8 @@ class TestStage3StatisticsSimulation(unittest.TestCase):
             )
             self.assertEqual(resets, [])
 
-            # Gap should be detected between 3600 and 10800 (missing one 7200 row).
+            # Only the pre-first-state gap should be detected (missing one 7200 row).
+            # The internal 14400 bucket is forward-filled and should not create a gap.
             gaps = collect_missing_statistics_row_ranges(
                 ro, "statistics_generated", "sensor.new", interval_seconds=3600
             )

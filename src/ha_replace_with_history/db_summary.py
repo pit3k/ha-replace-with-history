@@ -996,6 +996,53 @@ def build_statistics_generated_view_sql(
 
     if statistics_kind == "total_increasing":
         new_stats_cte = f"""
+bucket_last1 AS (
+    SELECT start_ts, state, sum, last_reset, last_reset_ts
+    FROM bucket_last
+    WHERE rn = 1
+),
+bounds AS (
+    SELECT
+        CAST(MIN(ts) / {interval_seconds} AS INT) * {interval_seconds} AS min_bucket,
+        (SELECT cutoff_bucket FROM cutoff) AS cutoff_bucket
+    FROM num_states
+),
+buckets(start_ts) AS (
+    SELECT min_bucket FROM bounds WHERE min_bucket IS NOT NULL AND cutoff_bucket IS NOT NULL
+    UNION ALL
+    SELECT start_ts + {interval_seconds}
+    FROM buckets, bounds
+    WHERE (start_ts + {interval_seconds}) < bounds.cutoff_bucket
+),
+bucket_join AS (
+    SELECT
+        b.start_ts,
+        bl.state,
+        bl.sum,
+        bl.last_reset,
+        bl.last_reset_ts
+    FROM buckets b
+    LEFT JOIN bucket_last1 bl ON bl.start_ts = b.start_ts
+),
+filled AS (
+    SELECT
+        start_ts,
+        state,
+        sum,
+        last_reset,
+        last_reset_ts
+    FROM bucket_join
+    WHERE start_ts = (SELECT MIN(start_ts) FROM bucket_join)
+    UNION ALL
+    SELECT
+        j.start_ts,
+        COALESCE(j.state, f.state) AS state,
+        COALESCE(j.sum, f.sum) AS sum,
+        COALESCE(j.last_reset, f.last_reset) AS last_reset,
+        COALESCE(j.last_reset_ts, f.last_reset_ts) AS last_reset_ts
+    FROM filled f
+    JOIN bucket_join j ON j.start_ts = f.start_ts + {interval_seconds}
+),
 new_stats AS (
     SELECT
         {new_id_q} AS statistic_id,
@@ -1008,15 +1055,60 @@ new_stats AS (
         NULL AS mean,
         NULL AS min,
         NULL AS max
-    FROM bucket_last
-    WHERE rn = 1
-      AND start_ts < (SELECT cutoff_bucket FROM cutoff)
+    FROM filled
 )
 """.strip()
     elif statistics_kind == "total":
         out_last_reset = "NULL" if stats_has_last_reset_ts else "last_reset"
         out_last_reset_ts = "last_reset_ts" if stats_has_last_reset_ts else "NULL"
         new_stats_cte = f"""
+bucket_last1 AS (
+    SELECT start_ts, state, sum, last_reset, last_reset_ts
+    FROM bucket_last
+    WHERE rn = 1
+),
+bounds AS (
+    SELECT
+        CAST(MIN(ts) / {interval_seconds} AS INT) * {interval_seconds} AS min_bucket,
+        (SELECT cutoff_bucket FROM cutoff) AS cutoff_bucket
+    FROM num_states
+),
+buckets(start_ts) AS (
+    SELECT min_bucket FROM bounds WHERE min_bucket IS NOT NULL AND cutoff_bucket IS NOT NULL
+    UNION ALL
+    SELECT start_ts + {interval_seconds}
+    FROM buckets, bounds
+    WHERE (start_ts + {interval_seconds}) < bounds.cutoff_bucket
+),
+bucket_join AS (
+    SELECT
+        b.start_ts,
+        bl.state,
+        bl.sum,
+        bl.last_reset,
+        bl.last_reset_ts
+    FROM buckets b
+    LEFT JOIN bucket_last1 bl ON bl.start_ts = b.start_ts
+),
+filled AS (
+    SELECT
+        start_ts,
+        state,
+        sum,
+        last_reset,
+        last_reset_ts
+    FROM bucket_join
+    WHERE start_ts = (SELECT MIN(start_ts) FROM bucket_join)
+    UNION ALL
+    SELECT
+        j.start_ts,
+        COALESCE(j.state, f.state) AS state,
+        COALESCE(j.sum, f.sum) AS sum,
+        COALESCE(j.last_reset, f.last_reset) AS last_reset,
+        COALESCE(j.last_reset_ts, f.last_reset_ts) AS last_reset_ts
+    FROM filled f
+    JOIN bucket_join j ON j.start_ts = f.start_ts + {interval_seconds}
+),
 new_stats AS (
     SELECT
         {new_id_q} AS statistic_id,
@@ -1029,9 +1121,7 @@ new_stats AS (
         NULL AS mean,
         NULL AS min,
         NULL AS max
-    FROM bucket_last
-    WHERE rn = 1
-      AND start_ts < (SELECT cutoff_bucket FROM cutoff)
+    FROM filled
 )
 """.strip()
     else:
@@ -1052,22 +1142,67 @@ bucket_last2 AS (
         ROW_NUMBER() OVER (PARTITION BY CAST(ts / {interval_seconds} AS INT) * {interval_seconds} ORDER BY ts DESC) AS rn
     FROM num_states
 ),
+bucket_last1 AS (
+    SELECT start_ts, state
+    FROM bucket_last2
+    WHERE rn = 1
+),
+bounds AS (
+    SELECT
+        CAST(MIN(ts) / {interval_seconds} AS INT) * {interval_seconds} AS min_bucket,
+        (SELECT cutoff_bucket FROM cutoff) AS cutoff_bucket
+    FROM num_states
+),
+buckets(start_ts) AS (
+    SELECT min_bucket FROM bounds WHERE min_bucket IS NOT NULL AND cutoff_bucket IS NOT NULL
+    UNION ALL
+    SELECT start_ts + {interval_seconds}
+    FROM buckets, bounds
+    WHERE (start_ts + {interval_seconds}) < bounds.cutoff_bucket
+),
+bucket_join AS (
+    SELECT
+        b.start_ts,
+        bl.state AS state,
+        a.mean AS mean,
+        a.min AS min,
+        a.max AS max
+    FROM buckets b
+    LEFT JOIN bucket_last1 bl ON bl.start_ts = b.start_ts
+    LEFT JOIN bucket_aggs a ON a.start_ts = b.start_ts
+),
+filled AS (
+    SELECT
+        start_ts,
+        state,
+        mean,
+        min,
+        max
+    FROM bucket_join
+    WHERE start_ts = (SELECT MIN(start_ts) FROM bucket_join)
+    UNION ALL
+    SELECT
+        j.start_ts,
+        COALESCE(j.state, f.state) AS state,
+        COALESCE(j.mean, f.mean) AS mean,
+        COALESCE(j.min, f.min) AS min,
+        COALESCE(j.max, f.max) AS max
+    FROM filled f
+    JOIN bucket_join j ON j.start_ts = f.start_ts + {interval_seconds}
+),
 new_stats AS (
     SELECT
         {new_id_q} AS statistic_id,
         CAST(strftime('%s','now') AS REAL) AS created_ts,
-        a.start_ts,
-        l.state AS state,
+        start_ts,
+        state,
         NULL AS sum,
         NULL AS last_reset,
         NULL AS last_reset_ts,
-        a.mean AS mean,
-        a.min AS min,
-        a.max AS max
-    FROM bucket_aggs a
-    JOIN bucket_last2 l ON l.start_ts = a.start_ts
-    WHERE l.rn = 1
-      AND a.start_ts < (SELECT cutoff_bucket FROM cutoff)
+        mean AS mean,
+        min AS min,
+        max AS max
+    FROM filled
 )
 """.strip()
 
