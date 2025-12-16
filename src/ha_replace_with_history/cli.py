@@ -131,6 +131,8 @@ def main(argv: list[str] | None = None) -> int:
             old_state_class=stage1.old_state_class,
             new_state_class=stage1.new_state_class,
             new_entity_started_from_0=args.new_entity_started_from_0,
+            old_summary=old_summary,
+            new_summary=new_summary,
             apply=args.apply,
             color=use_color,
         )

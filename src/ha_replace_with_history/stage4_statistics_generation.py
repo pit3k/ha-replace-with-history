@@ -7,7 +7,6 @@ from pathlib import Path
 from .db_summary import (
     DbSummaryError,
     apply_sql_script,
-    build_statistics_change_report,
     build_statistics_change_report_with_epochs,
     condense_statistics_change_report_rows,
     build_statistics_update_sql_script,
@@ -16,7 +15,6 @@ from .db_summary import (
     collect_reset_events_statistics,
     connect_readonly_sqlite,
     create_statistics_generated_view,
-    get_earliest_state_ts_epoch,
     get_latest_statistics_ts_epoch,
     snapshot_statistics_rows,
 )
@@ -38,6 +36,8 @@ def run_statistics_generation(
     old_state_class: str | None,
     new_state_class: str | None,
     new_entity_started_from_0: bool,
+    old_summary: dict[str, object],
+    new_summary: dict[str, object],
     apply: bool,
     color: bool,
 ) -> Stage4Result:
@@ -64,19 +64,30 @@ def run_statistics_generation(
         return Stage4Result(ran=False, sql_path=None)
 
     # Preconditions:
-    # - new states earliest > old stats latest
-    new_states_earliest = get_earliest_state_ts_epoch(conn, new_entity_id)
+    # - new states earliest_available > old states latest_available
+    old_states = old_summary.get("states") if isinstance(old_summary, dict) else None
+    new_states = new_summary.get("states") if isinstance(new_summary, dict) else None
+    old_latest = (
+        ((old_states or {}).get("latest_available") or (old_states or {}).get("latest") or {}).get("ts")
+        if isinstance(old_states, dict)
+        else None
+    )
+    new_earliest = (
+        ((new_states or {}).get("earliest_available") or (new_states or {}).get("earliest") or {}).get("ts")
+        if isinstance(new_states, dict)
+        else None
+    )
+
+    if not old_latest or not new_earliest:
+        print("Stage 4 skipped: missing state timestamps for precondition checks.")
+        return Stage4Result(ran=False, sql_path=None)
+
+    if not (new_earliest > old_latest):
+        print("Stage 4 skipped: precondition failed (new states must start after old states end).")
+        return Stage4Result(ran=False, sql_path=None)
+
     old_stats_latest = get_latest_statistics_ts_epoch(conn, "statistics", old_entity_id)
     old_stats_st_latest = get_latest_statistics_ts_epoch(conn, "statistics_short_term", old_entity_id)
-    old_stats_latest_any = max([v for v in (old_stats_latest, old_stats_st_latest) if v is not None], default=None)
-
-    if new_states_earliest is None or old_stats_latest_any is None:
-        print("Stage 4 skipped: missing states/statistics timestamps for precondition checks.")
-        return Stage4Result(ran=False, sql_path=None)
-
-    if not (new_states_earliest > old_stats_latest_any):
-        print("Stage 4 skipped: precondition failed (new states earliest must be after old statistics latest).")
-        return Stage4Result(ran=False, sql_path=None)
 
     # Stage 5 diffs should only consider newly generated rows (based on new entity states),
     # excluding the portion copied from the old entity statistics.
