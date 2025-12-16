@@ -78,7 +78,7 @@ def connect_readonly_sqlite(db_path: Path) -> sqlite3.Connection:
 def apply_sql_script(db_path: Path, sql_script: str) -> None:
     """Execute a SQL script against the DB (read-write) and commit.
 
-    Intended for Stage 3 application. The script may include its own BEGIN/COMMIT.
+    Intended for Stage 4 application. The script may include its own BEGIN/COMMIT.
     """
     conn = sqlite3.connect(str(db_path))
     try:
@@ -854,7 +854,7 @@ def get_latest_statistics_ts_epoch(conn: sqlite3.Connection, table: str, statist
     return _to_epoch_seconds(row["ts"], assume_seconds=ts_is_seconds)
 
 
-def create_stage3_statistics_view(
+def create_statistics_generated_view(
     conn: sqlite3.Connection,
     *,
     view_name: str,
@@ -865,110 +865,110 @@ def create_stage3_statistics_view(
     statistics_kind: str,
     new_entity_started_from_0: bool,
 ) -> None:
-        """Create a TEMP VIEW for stage 3 simulated statistics."""
-        sql = build_stage3_statistics_view_sql(
-                conn,
-                view_name=view_name,
-                source_table=source_table,
-                old_statistic_id=old_statistic_id,
-                new_statistic_id=new_statistic_id,
-                interval_seconds=interval_seconds,
-                statistics_kind=statistics_kind,
-                new_entity_started_from_0=new_entity_started_from_0,
-        )
+    """Create a TEMP VIEW for generated statistics (Stage 4)."""
+    sql = build_statistics_generated_view_sql(
+        conn,
+        view_name=view_name,
+        source_table=source_table,
+        old_statistic_id=old_statistic_id,
+        new_statistic_id=new_statistic_id,
+        interval_seconds=interval_seconds,
+        statistics_kind=statistics_kind,
+        new_entity_started_from_0=new_entity_started_from_0,
+    )
 
-        conn.execute(f"DROP VIEW IF EXISTS {view_name}")
-        conn.execute(sql)
+    conn.execute(f"DROP VIEW IF EXISTS {view_name}")
+    conn.execute(sql)
 
 
-def build_stage3_statistics_view_sql(
-        conn: sqlite3.Connection,
-        *,
-        view_name: str,
-        source_table: str,
-        old_statistic_id: str,
-        new_statistic_id: str,
-        interval_seconds: int,
+def build_statistics_generated_view_sql(
+    conn: sqlite3.Connection,
+    *,
+    view_name: str,
+    source_table: str,
+    old_statistic_id: str,
+    new_statistic_id: str,
+    interval_seconds: int,
     statistics_kind: str,
     new_entity_started_from_0: bool,
 ) -> str:
-        """Return the CREATE TEMP VIEW SQL for stage 3 simulated statistics."""
-        if not _table_exists(conn, source_table):
-                raise DbSummaryError(f"Missing statistics table: {source_table}")
-        if not _table_exists(conn, "states"):
-                raise DbSummaryError("Missing states table")
+    """Return the CREATE TEMP VIEW SQL for generated statistics (Stage 4)."""
+    if not _table_exists(conn, source_table):
+        raise DbSummaryError(f"Missing statistics table: {source_table}")
+    if not _table_exists(conn, "states"):
+        raise DbSummaryError("Missing states table")
 
-        def sql_quote(text: str) -> str:
-                return "'" + text.replace("'", "''") + "'"
+    def sql_quote(text: str) -> str:
+        return "'" + text.replace("'", "''") + "'"
 
-        old_id_q = sql_quote(old_statistic_id)
-        new_id_q = sql_quote(new_statistic_id)
+    old_id_q = sql_quote(old_statistic_id)
+    new_id_q = sql_quote(new_statistic_id)
 
-        # Stats table schema
-        s_cols = _columns(conn, source_table)
-        s_ts_col = _pick_first_present(s_cols, ["start_ts", "start"])
-        if s_ts_col is None:
-                raise DbSummaryError(f"No start_ts/start column in {source_table}")
-        stats_ts_is_seconds = s_ts_col.endswith("_ts")
+    # Stats table schema
+    s_cols = _columns(conn, source_table)
+    s_ts_col = _pick_first_present(s_cols, ["start_ts", "start"])
+    if s_ts_col is None:
+        raise DbSummaryError(f"No start_ts/start column in {source_table}")
+    stats_ts_is_seconds = s_ts_col.endswith("_ts")
 
-        if "metadata_id" in s_cols and _table_exists(conn, "statistics_meta"):
-                meta_cols = _columns(conn, "statistics_meta")
-                if not ("statistic_id" in meta_cols and "id" in meta_cols):
-                        raise DbSummaryError("statistics_meta missing required columns")
-                stats_from_sql = f"{source_table} t JOIN statistics_meta m ON m.id = t.metadata_id"
-                stats_where_sql = f"m.statistic_id = {old_id_q}"
-        elif "statistic_id" in s_cols:
-                stats_from_sql = f"{source_table} t"
-                stats_where_sql = f"t.statistic_id = {old_id_q}"
+    if "metadata_id" in s_cols and _table_exists(conn, "statistics_meta"):
+        meta_cols = _columns(conn, "statistics_meta")
+        if not ("statistic_id" in meta_cols and "id" in meta_cols):
+            raise DbSummaryError("statistics_meta missing required columns")
+        stats_from_sql = f"{source_table} t JOIN statistics_meta m ON m.id = t.metadata_id"
+        stats_where_sql = f"m.statistic_id = {old_id_q}"
+    elif "statistic_id" in s_cols:
+        stats_from_sql = f"{source_table} t"
+        stats_where_sql = f"t.statistic_id = {old_id_q}"
+    else:
+        raise DbSummaryError(f"Unsupported schema for {source_table}")
+
+    # States schema
+    st_cols = _columns(conn, "states")
+    st_ts_col = _pick_first_present(st_cols, ["last_updated_ts", "last_changed_ts", "last_updated", "last_changed"])
+    if st_ts_col is None:
+        raise DbSummaryError("No timestamp column in states")
+    states_ts_is_seconds = st_ts_col.endswith("_ts")
+
+    if "metadata_id" in st_cols and _table_exists(conn, "states_meta"):
+        states_from_sql = "states s JOIN states_meta sm ON sm.metadata_id = s.metadata_id"
+        states_where_sql = f"sm.entity_id = {new_id_q}"
+    elif "entity_id" in st_cols:
+        states_from_sql = "states s"
+        states_where_sql = f"s.entity_id = {new_id_q}"
+    else:
+        raise DbSummaryError("Unsupported schema for states")
+
+    def epoch_expr(col_ref: str, *, assume_seconds: bool) -> str:
+        if assume_seconds:
+            return f"CAST({col_ref} AS REAL)"
+        return f"CAST(strftime('%s', {col_ref}) AS REAL)"
+
+    stats_epoch = epoch_expr(f"t.{s_ts_col}", assume_seconds=stats_ts_is_seconds)
+    states_epoch = epoch_expr(f"s.{st_ts_col}", assume_seconds=states_ts_is_seconds)
+
+    stats_state_sel = "t.state" if "state" in s_cols else "NULL"
+    stats_sum_sel = "t.sum" if "sum" in s_cols else "NULL"
+    stats_mean_sel = "t.mean" if "mean" in s_cols else "NULL"
+    stats_min_sel = "t.min" if "min" in s_cols else "NULL"
+    stats_max_sel = "t.max" if "max" in s_cols else "NULL"
+    stats_created_sel = "t.created_ts" if "created_ts" in s_cols else "NULL"
+
+    if statistics_kind not in {"total_increasing", "measurement"}:
+        raise DbSummaryError(f"Unsupported statistics_kind: {statistics_kind}")
+
+    if statistics_kind == "total_increasing":
+        if "sum" in s_cols:
+            base_sum_expr = "COALESCE((SELECT os.sum FROM old_stats os WHERE os.sum IS NOT NULL ORDER BY os.start_ts DESC LIMIT 1), 0.0)"
         else:
-                raise DbSummaryError(f"Unsupported schema for {source_table}")
+            base_sum_expr = "0.0"
+    else:
+        base_sum_expr = "0.0"
 
-        # States schema
-        st_cols = _columns(conn, "states")
-        st_ts_col = _pick_first_present(st_cols, ["last_updated_ts", "last_changed_ts", "last_updated", "last_changed"])
-        if st_ts_col is None:
-                raise DbSummaryError("No timestamp column in states")
-        states_ts_is_seconds = st_ts_col.endswith("_ts")
+    first_dv_expr = "v" if (statistics_kind == "total_increasing" and new_entity_started_from_0) else "0.0"
 
-        if "metadata_id" in st_cols and _table_exists(conn, "states_meta"):
-                states_from_sql = "states s JOIN states_meta sm ON sm.metadata_id = s.metadata_id"
-                states_where_sql = f"sm.entity_id = {new_id_q}"
-        elif "entity_id" in st_cols:
-                states_from_sql = "states s"
-                states_where_sql = f"s.entity_id = {new_id_q}"
-        else:
-                raise DbSummaryError("Unsupported schema for states")
-
-        def epoch_expr(col_ref: str, *, assume_seconds: bool) -> str:
-                if assume_seconds:
-                        return f"CAST({col_ref} AS REAL)"
-                return f"CAST(strftime('%s', {col_ref}) AS REAL)"
-
-        stats_epoch = epoch_expr(f"t.{s_ts_col}", assume_seconds=stats_ts_is_seconds)
-        states_epoch = epoch_expr(f"s.{st_ts_col}", assume_seconds=states_ts_is_seconds)
-
-        stats_state_sel = "t.state" if "state" in s_cols else "NULL"
-        stats_sum_sel = "t.sum" if "sum" in s_cols else "NULL"
-        stats_mean_sel = "t.mean" if "mean" in s_cols else "NULL"
-        stats_min_sel = "t.min" if "min" in s_cols else "NULL"
-        stats_max_sel = "t.max" if "max" in s_cols else "NULL"
-        stats_created_sel = "t.created_ts" if "created_ts" in s_cols else "NULL"
-
-        if statistics_kind not in {"total_increasing", "measurement"}:
-                raise DbSummaryError(f"Unsupported statistics_kind: {statistics_kind}")
-
-        if statistics_kind == "total_increasing":
-                if "sum" in s_cols:
-                        base_sum_expr = "COALESCE((SELECT os.sum FROM old_stats os WHERE os.sum IS NOT NULL ORDER BY os.start_ts DESC LIMIT 1), 0.0)"
-                else:
-                        base_sum_expr = "0.0"
-        else:
-                base_sum_expr = "0.0"
-
-        first_dv_expr = "v" if (statistics_kind == "total_increasing" and new_entity_started_from_0) else "0.0"
-
-        if statistics_kind == "total_increasing":
-                new_stats_cte = f"""
+    if statistics_kind == "total_increasing":
+        new_stats_cte = f"""
 new_stats AS (
     SELECT
         {new_id_q} AS statistic_id,
@@ -983,8 +983,8 @@ new_stats AS (
     WHERE rn = 1
 )
 """.strip()
-        else:
-                new_stats_cte = f"""
+    else:
+        new_stats_cte = f"""
 bucket_aggs AS (
     SELECT
         CAST(ts / {interval_seconds} AS INT) * {interval_seconds} AS start_ts,
@@ -1017,7 +1017,7 @@ new_stats AS (
 )
 """.strip()
 
-        return f"""
+    return f"""
 CREATE TEMP VIEW {view_name} AS
 WITH
 old_stats AS (
@@ -1086,137 +1086,137 @@ SELECT statistic_id, created_ts, start_ts, state, sum, mean, min, max FROM new_s
 """.strip()
 
 
-def build_stage3_update_sql_script(
-        conn: sqlite3.Connection,
-        *,
-        old_entity_id: str,
-        new_entity_id: str,
-        stats_view: str,
-        stats_st_view: str,
+def build_statistics_update_sql_script(
+    conn: sqlite3.Connection,
+    *,
+    old_entity_id: str,
+    new_entity_id: str,
+    stats_view: str,
+    stats_st_view: str,
     statistics_kind: str,
     new_entity_started_from_0: bool,
 ) -> str:
-        """Build a SQL script that deletes+inserts statistics rows for new_entity_id.
+    """Build a SQL script that deletes+inserts statistics rows for new_entity_id.
 
-        The script recreates the TEMP VIEWs (single-SELECT generation) and then:
-        - deletes existing rows for the new entity
-        - inserts the simulated rows
-        """
+    Stage 4: the script recreates the TEMP VIEWs (single-SELECT generation) and then:
+    - deletes existing rows for the new entity
+    - inserts the generated rows
+    """
 
-        def sql_quote(text: str) -> str:
-                return "'" + text.replace("'", "''") + "'"
+    def sql_quote(text: str) -> str:
+        return "'" + text.replace("'", "''") + "'"
 
-        new_id_q = sql_quote(new_entity_id)
+    new_id_q = sql_quote(new_entity_id)
 
-        def table_dml(table: str, view: str) -> str:
-                cols = _columns(conn, table)
-                ts_col = "start_ts" if "start_ts" in cols else ("start" if "start" in cols else None)
-                if ts_col is None:
-                        raise DbSummaryError(f"No start_ts/start column in {table}")
+    def table_dml(table: str, view: str) -> str:
+        cols = _columns(conn, table)
+        ts_col = "start_ts" if "start_ts" in cols else ("start" if "start" in cols else None)
+        if ts_col is None:
+            raise DbSummaryError(f"No start_ts/start column in {table}")
 
-                # Destination columns to populate
-                dest_cols: list[str] = []
-                select_cols: list[str] = []
+        # Destination columns to populate
+        dest_cols: list[str] = []
+        select_cols: list[str] = []
 
-                if "metadata_id" in cols:
-                        if not _table_exists(conn, "statistics_meta"):
-                                raise DbSummaryError("statistics_meta missing (required for metadata schema)")
-                        meta_cols = _columns(conn, "statistics_meta")
-                        if not ("id" in meta_cols and "statistic_id" in meta_cols):
-                                raise DbSummaryError("statistics_meta missing required columns")
-                        meta_id_expr = f"(SELECT id FROM statistics_meta WHERE statistic_id = {new_id_q})"
-                        delete_sql = f"DELETE FROM {table} WHERE metadata_id = {meta_id_expr};"
-                        dest_cols.append("metadata_id")
-                        select_cols.append(f"{meta_id_expr} AS metadata_id")
-                elif "statistic_id" in cols:
-                        delete_sql = f"DELETE FROM {table} WHERE statistic_id = {new_id_q};"
-                        dest_cols.append("statistic_id")
-                        select_cols.append("statistic_id")
-                else:
-                        raise DbSummaryError(f"Unsupported schema for {table}")
+        if "metadata_id" in cols:
+            if not _table_exists(conn, "statistics_meta"):
+                raise DbSummaryError("statistics_meta missing (required for metadata schema)")
+            meta_cols = _columns(conn, "statistics_meta")
+            if not ("id" in meta_cols and "statistic_id" in meta_cols):
+                raise DbSummaryError("statistics_meta missing required columns")
+            meta_id_expr = f"(SELECT id FROM statistics_meta WHERE statistic_id = {new_id_q})"
+            delete_sql = f"DELETE FROM {table} WHERE metadata_id = {meta_id_expr};"
+            dest_cols.append("metadata_id")
+            select_cols.append(f"{meta_id_expr} AS metadata_id")
+        elif "statistic_id" in cols:
+            delete_sql = f"DELETE FROM {table} WHERE statistic_id = {new_id_q};"
+            dest_cols.append("statistic_id")
+            select_cols.append("statistic_id")
+        else:
+            raise DbSummaryError(f"Unsupported schema for {table}")
 
-                if ts_col == "start_ts":
-                        dest_cols.append("start_ts")
-                        select_cols.append("start_ts")
-                else:
-                        dest_cols.append("start")
-                        select_cols.append("datetime(start_ts, 'unixepoch') AS start")
+        if ts_col == "start_ts":
+            dest_cols.append("start_ts")
+            select_cols.append("start_ts")
+        else:
+            dest_cols.append("start")
+            select_cols.append("datetime(start_ts, 'unixepoch') AS start")
 
-                if "created_ts" in cols:
-                    dest_cols.append("created_ts")
-                    select_cols.append("COALESCE(created_ts, CAST(strftime('%s','now') AS REAL)) AS created_ts")
+        if "created_ts" in cols:
+            dest_cols.append("created_ts")
+            select_cols.append("COALESCE(created_ts, CAST(strftime('%s','now') AS REAL)) AS created_ts")
 
-                # Measurement aggregates
-                for c in ("min", "mean", "max"):
-                    if c in cols:
-                        dest_cols.append(c)
-                        select_cols.append(c)
+        # Measurement aggregates
+        for c in ("min", "mean", "max"):
+            if c in cols:
+                dest_cols.append(c)
+                select_cols.append(c)
 
-                if "state" in cols:
-                        dest_cols.append("state")
-                        select_cols.append("state")
-                if "sum" in cols:
-                        dest_cols.append("sum")
-                        select_cols.append("sum")
+        if "state" in cols:
+            dest_cols.append("state")
+            select_cols.append("state")
+        if "sum" in cols:
+            dest_cols.append("sum")
+            select_cols.append("sum")
 
-                insert_sql = (
-                        f"INSERT INTO {table}({', '.join(dest_cols)})\n"
-                        f"SELECT {', '.join(select_cols)} FROM {view} WHERE statistic_id = {new_id_q};"
-                )
-
-                return f"-- {table}\n{delete_sql}\n{insert_sql}"
-
-        sql_stats = build_stage3_statistics_view_sql(
-                conn,
-                view_name=stats_view,
-                source_table="statistics",
-                old_statistic_id=old_entity_id,
-                new_statistic_id=new_entity_id,
-                interval_seconds=3600,
-            statistics_kind=statistics_kind,
-            new_entity_started_from_0=new_entity_started_from_0,
-        )
-        sql_st = build_stage3_statistics_view_sql(
-                conn,
-                view_name=stats_st_view,
-                source_table="statistics_short_term",
-                old_statistic_id=old_entity_id,
-                new_statistic_id=new_entity_id,
-                interval_seconds=300,
-            statistics_kind=statistics_kind,
-            new_entity_started_from_0=new_entity_started_from_0,
+        insert_sql = (
+            f"INSERT INTO {table}({', '.join(dest_cols)})\n"
+            f"SELECT {', '.join(select_cols)} FROM {view} WHERE statistic_id = {new_id_q};"
         )
 
-        parts = [
-                "-- Stage 3 statistics rebuild script",
-                f"-- old_entity_id: {old_entity_id}",
-                f"-- new_entity_id: {new_entity_id}",
-                "-- WARNING: Review before executing. This script deletes existing statistics rows for new_entity_id.",
-                "BEGIN;",
-                f"DROP VIEW IF EXISTS {stats_view};",
-            sql_stats,
-                f"DROP VIEW IF EXISTS {stats_st_view};",
-            sql_st,
-                table_dml("statistics", stats_view),
-                table_dml("statistics_short_term", stats_st_view),
-                "COMMIT;",
-                "-- End",
-        ]
+        return f"-- {table}\n{delete_sql}\n{insert_sql}"
 
-        return "\n\n".join(parts) + "\n"
+    sql_stats = build_statistics_generated_view_sql(
+        conn,
+        view_name=stats_view,
+        source_table="statistics",
+        old_statistic_id=old_entity_id,
+        new_statistic_id=new_entity_id,
+        interval_seconds=3600,
+        statistics_kind=statistics_kind,
+        new_entity_started_from_0=new_entity_started_from_0,
+    )
+    sql_st = build_statistics_generated_view_sql(
+        conn,
+        view_name=stats_st_view,
+        source_table="statistics_short_term",
+        old_statistic_id=old_entity_id,
+        new_statistic_id=new_entity_id,
+        interval_seconds=300,
+        statistics_kind=statistics_kind,
+        new_entity_started_from_0=new_entity_started_from_0,
+    )
+
+    parts = [
+        "-- Stage 4 statistics generation script",
+        f"-- old_entity_id: {old_entity_id}",
+        f"-- new_entity_id: {new_entity_id}",
+        "-- WARNING: Review before executing. This script deletes existing statistics rows for new_entity_id.",
+        "BEGIN;",
+        f"DROP VIEW IF EXISTS {stats_view};",
+        sql_stats,
+        f"DROP VIEW IF EXISTS {stats_st_view};",
+        sql_st,
+        table_dml("statistics", stats_view),
+        table_dml("statistics_short_term", stats_st_view),
+        "COMMIT;",
+        "-- End",
+    ]
+
+    return "\n\n".join(parts) + "\n"
 
 
-def collect_stage3_statistics_preview_rows(
+def collect_generated_statistics_preview_rows(
     conn: sqlite3.Connection,
     *,
     source_table: str,
     old_entity_id: str,
     new_entity_id: str,
-    stage3_view: str,
+    generated_view: str,
     first_generated: int = 3,
     last_generated: int = 3,
 ) -> list[dict[str, str]]:
-    """Preview of Stage 3 rows: 1 copied row + first/last generated rows.
+    """Preview of generated rows: 1 copied row + first/last generated rows.
 
     - "Copied" row is the last row at or before the old entity's latest timestamp in
       the corresponding source table.
@@ -1224,7 +1224,7 @@ def collect_stage3_statistics_preview_rows(
     - If there are more generated rows than shown, inserts an ellipsis row.
     """
 
-    if not _table_exists(conn, stage3_view):
+    if not _table_exists(conn, generated_view):
         return []
 
     old_latest = get_latest_statistics_ts_epoch(conn, source_table, old_entity_id)
@@ -1244,7 +1244,7 @@ def collect_stage3_statistics_preview_rows(
     copied = conn.execute(
         f"""
                 SELECT start_ts, state, sum, mean, min, max
-        FROM {stage3_view}
+                FROM {generated_view}
         WHERE statistic_id = ?
           AND start_ts <= ?
         ORDER BY start_ts DESC
@@ -1256,7 +1256,7 @@ def collect_stage3_statistics_preview_rows(
     gen_first = conn.execute(
         f"""
                 SELECT start_ts, state, sum, mean, min, max
-        FROM {stage3_view}
+                FROM {generated_view}
         WHERE statistic_id = ?
           AND start_ts > ?
         ORDER BY start_ts ASC
@@ -1268,7 +1268,7 @@ def collect_stage3_statistics_preview_rows(
     gen_last_desc = conn.execute(
         f"""
                 SELECT start_ts, state, sum, mean, min, max
-        FROM {stage3_view}
+                FROM {generated_view}
         WHERE statistic_id = ?
           AND start_ts > ?
         ORDER BY start_ts DESC
@@ -1281,7 +1281,7 @@ def collect_stage3_statistics_preview_rows(
     gen_count = conn.execute(
         f"""
         SELECT COUNT(*) AS c
-        FROM {stage3_view}
+                FROM {generated_view}
         WHERE statistic_id = ?
           AND start_ts > ?
         """.strip(),
@@ -1297,7 +1297,7 @@ def collect_stage3_statistics_preview_rows(
         all_gen = conn.execute(
             f"""
                         SELECT start_ts, state, sum, mean, min, max
-            FROM {stage3_view}
+                        FROM {generated_view}
             WHERE statistic_id = ?
               AND start_ts > ?
             ORDER BY start_ts ASC

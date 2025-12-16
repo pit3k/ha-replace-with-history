@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "ha-replace-with-history"
 version = "0.1.0"
-description = "CLI tool for checking/fixing Home Assistant entity history (stage 1: entity registry report)."
+description = "CLI tool for analyzing/rebuilding Home Assistant entity history (stages 1-4: entity/state/statistics analysis + statistics generation)."
 requires-python = ">=3.9"
 readme = "README.md"
 

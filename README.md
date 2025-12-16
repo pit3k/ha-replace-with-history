@@ -1,8 +1,10 @@
 # ha-replace-with-history
 
 Compares two Home Assistant `entity_id`s in:
-- Stage 1: the entity registry (`.storage/core.entity_registry`)
-- Stage 2: the SQLite recorder DB (`home-assistant_v2.db`) summary (counts + earliest/latest + null/empty)
+- Stage 1: entity analysis from the entity registry (`.storage/core.entity_registry`)
+- Stage 2: state analysis from the SQLite recorder DB (`home-assistant_v2.db`)
+- Stage 3: statistics analysis from the SQLite recorder DB (`home-assistant_v2.db`)
+- Stage 4: statistics generation (writes `update.sql`, optionally applies it)
 
 ## Usage
 
@@ -75,15 +77,18 @@ Note: for statistics, the tool currently queries by `statistic_id == entity_id`.
 
 ## Stage 3: Statistics rebuild (total_increasing only)
 
-When both entities are `total_increasing` and the precondition passes (`new` states start after `old` statistics end), the tool simulates a rebuilt statistics history for `new_entity_id` and analyzes it using the same reset and missing-row reports as stage 2.
+## Stage 4: Statistics generation
 
-When Stage 3 runs, it also writes a SQL script into the current working directory named like:
-`update.sql`
+When both entities share a supported `state_class` (`total_increasing` or `measurement`) and the precondition passes (`new` states start after `old` statistics end), the tool generates replacement statistics rows for `new_entity_id`.
 
-That script recreates the Stage 3 TEMP VIEWs and then deletes+inserts rows in `statistics` and `statistics_short_term` for `new_entity_id`.
+Stage 4 writes `update.sql` in the current working directory. The script recreates TEMP VIEWs named:
+- `statistics_generated`
+- `statistics_short_term_generated`
 
-Stage 3 flag:
-- `--new-entity-started-from-0={true|false}` (default: `true`): when `true`, the first generated `sum` includes the full first reading from the new entity (treating it as a restart from 0). When `false`, the first generated row does not add the first reading (current behavior).
+Then it deletes+inserts rows in `statistics` and `statistics_short_term` for `new_entity_id`.
+
+Stage 4 flag:
+- `--new-entity-started-from-0={true|false}` (default: `true`): for `total_increasing`, controls whether the first generated `sum` includes the first reading from the new entity (treating it as a restart from 0).
 
 ## Getting the DB from HAOS (LAN)
 

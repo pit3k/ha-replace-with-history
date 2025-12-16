@@ -6,12 +6,12 @@ from pathlib import Path
 
 from ha_replace_with_history.db_summary import (
     apply_sql_script,
-    build_stage3_update_sql_script,
+    build_statistics_update_sql_script,
     collect_missing_statistics_row_ranges,
     collect_reset_events_statistics,
-    collect_stage3_statistics_preview_rows,
+    collect_generated_statistics_preview_rows,
     connect_readonly_sqlite,
-    create_stage3_statistics_view,
+    create_statistics_generated_view,
     get_earliest_state_ts_epoch,
     get_latest_statistics_ts_epoch,
 )
@@ -69,9 +69,9 @@ class TestStage3StatisticsSimulation(unittest.TestCase):
             self.assertIsNotNone(old_latest)
             self.assertGreater(new_earliest, old_latest)
 
-            create_stage3_statistics_view(
+            create_statistics_generated_view(
                 ro,
-                view_name="stage3_statistics",
+                view_name="statistics_generated",
                 source_table="statistics",
                 old_statistic_id="sensor.old",
                 new_statistic_id="sensor.new",
@@ -81,16 +81,16 @@ class TestStage3StatisticsSimulation(unittest.TestCase):
             )
 
             # Simulated resets should be none for this data.
-            resets = collect_reset_events_statistics(ro, "stage3_statistics", "sensor.new")
+            resets = collect_reset_events_statistics(ro, "statistics_generated", "sensor.new")
             self.assertEqual(resets, [])
 
             # Gap should be detected between 3600 and 10800 (missing one 7200 row).
             gaps = collect_missing_statistics_row_ranges(
-                ro, "stage3_statistics", "sensor.new", interval_seconds=3600
+                ro, "statistics_generated", "sensor.new", interval_seconds=3600
             )
             self.assertEqual(len(gaps), 1)
             self.assertEqual(gaps[0]["entity"], "sensor.new")
-            self.assertEqual(gaps[0]["table"], "stage3_statistics")
+            self.assertEqual(gaps[0]["table"], "statistics_generated")
             self.assertEqual(
                 gaps[0]["gap"],
                 f"{self._fmt_local(3600.0)} (20.0/110.0) - {self._fmt_local(10800.0)} (31.0/111.0) [1 rows]",
@@ -132,12 +132,12 @@ class TestStage3StatisticsSimulation(unittest.TestCase):
 
         ro = connect_readonly_sqlite(db_path)
         try:
-            script = build_stage3_update_sql_script(
+            script = build_statistics_update_sql_script(
                 ro,
                 old_entity_id="sensor.old",
                 new_entity_id="sensor.new",
-                stats_view="stage3_statistics",
-                stats_st_view="stage3_statistics_short_term",
+                stats_view="statistics_generated",
+                stats_st_view="statistics_short_term_generated",
                 statistics_kind="total_increasing",
                 new_entity_started_from_0=False,
             )
@@ -197,12 +197,12 @@ class TestStage3StatisticsSimulation(unittest.TestCase):
 
         ro = connect_readonly_sqlite(db_path)
         try:
-            script = build_stage3_update_sql_script(
+            script = build_statistics_update_sql_script(
                 ro,
                 old_entity_id="sensor.old",
                 new_entity_id="sensor.new",
-                stats_view="stage3_statistics",
-                stats_st_view="stage3_statistics_short_term",
+                stats_view="statistics_generated",
+                stats_st_view="statistics_short_term_generated",
                 statistics_kind="total_increasing",
                 new_entity_started_from_0=False,
             )
@@ -256,9 +256,9 @@ class TestStage3StatisticsSimulation(unittest.TestCase):
 
         ro = connect_readonly_sqlite(db_path)
         try:
-            create_stage3_statistics_view(
+            create_statistics_generated_view(
                 ro,
-                view_name="stage3_statistics",
+                view_name="statistics_generated",
                 source_table="statistics",
                 old_statistic_id="sensor.old",
                 new_statistic_id="sensor.new",
@@ -267,12 +267,12 @@ class TestStage3StatisticsSimulation(unittest.TestCase):
                 new_entity_started_from_0=False,
             )
 
-            preview = collect_stage3_statistics_preview_rows(
+            preview = collect_generated_statistics_preview_rows(
                 ro,
                 source_table="statistics",
                 old_entity_id="sensor.old",
                 new_entity_id="sensor.new",
-                stage3_view="stage3_statistics",
+                generated_view="statistics_generated",
                 first_generated=3,
                 last_generated=3,
             )
@@ -316,9 +316,9 @@ class TestStage3StatisticsSimulation(unittest.TestCase):
 
         ro = connect_readonly_sqlite(db_path)
         try:
-            create_stage3_statistics_view(
+            create_statistics_generated_view(
                 ro,
-                view_name="stage3_statistics",
+                view_name="statistics_generated",
                 source_table="statistics",
                 old_statistic_id="sensor.old",
                 new_statistic_id="sensor.new",
@@ -327,12 +327,12 @@ class TestStage3StatisticsSimulation(unittest.TestCase):
                 new_entity_started_from_0=False,
             )
 
-            preview = collect_stage3_statistics_preview_rows(
+            preview = collect_generated_statistics_preview_rows(
                 ro,
                 source_table="statistics",
                 old_entity_id="sensor.old",
                 new_entity_id="sensor.new",
-                stage3_view="stage3_statistics",
+                generated_view="statistics_generated",
                 first_generated=3,
                 last_generated=3,
             )
@@ -385,9 +385,9 @@ class TestStage3StatisticsSimulation(unittest.TestCase):
         ro = connect_readonly_sqlite(db_path)
         try:
             # started_from_0 = false => first generated sum stays at base_sum (110.0)
-            create_stage3_statistics_view(
+            create_statistics_generated_view(
                 ro,
-                view_name="stage3_statistics_false",
+                view_name="statistics_generated_false",
                 source_table="statistics",
                 old_statistic_id="sensor.old",
                 new_statistic_id="sensor.new",
@@ -396,15 +396,15 @@ class TestStage3StatisticsSimulation(unittest.TestCase):
                 new_entity_started_from_0=False,
             )
             sum_false = ro.execute(
-                "SELECT sum FROM stage3_statistics_false WHERE statistic_id = ? AND start_ts = ?",
+                "SELECT sum FROM statistics_generated_false WHERE statistic_id = ? AND start_ts = ?",
                 ("sensor.new", 10800.0),
             ).fetchone()["sum"]
             self.assertEqual(sum_false, 110.0)
 
             # started_from_0 = true => first generated sum includes full first reading (110 + 30)
-            create_stage3_statistics_view(
+            create_statistics_generated_view(
                 ro,
-                view_name="stage3_statistics_true",
+                view_name="statistics_generated_true",
                 source_table="statistics",
                 old_statistic_id="sensor.old",
                 new_statistic_id="sensor.new",
@@ -413,7 +413,7 @@ class TestStage3StatisticsSimulation(unittest.TestCase):
                 new_entity_started_from_0=True,
             )
             sum_true = ro.execute(
-                "SELECT sum FROM stage3_statistics_true WHERE statistic_id = ? AND start_ts = ?",
+                "SELECT sum FROM statistics_generated_true WHERE statistic_id = ? AND start_ts = ?",
                 ("sensor.new", 10800.0),
             ).fetchone()["sum"]
             self.assertEqual(sum_true, 140.0)
@@ -461,9 +461,9 @@ class TestStage3StatisticsSimulation(unittest.TestCase):
 
         ro = connect_readonly_sqlite(db_path)
         try:
-            create_stage3_statistics_view(
+            create_statistics_generated_view(
                 ro,
-                view_name="stage3_statistics",
+                view_name="statistics_generated",
                 source_table="statistics",
                 old_statistic_id="sensor.old",
                 new_statistic_id="sensor.new",
@@ -473,17 +473,17 @@ class TestStage3StatisticsSimulation(unittest.TestCase):
             )
 
             copied_created = ro.execute(
-                "SELECT created_ts FROM stage3_statistics WHERE statistic_id = ? AND start_ts = ?",
+                "SELECT created_ts FROM statistics_generated WHERE statistic_id = ? AND start_ts = ?",
                 ("sensor.new", 0.0),
             ).fetchone()["created_ts"]
             self.assertEqual(copied_created, 123.0)
 
-            script = build_stage3_update_sql_script(
+            script = build_statistics_update_sql_script(
                 ro,
                 old_entity_id="sensor.old",
                 new_entity_id="sensor.new",
-                stats_view="stage3_statistics",
-                stats_st_view="stage3_statistics_short_term",
+                stats_view="statistics_generated",
+                stats_st_view="statistics_short_term_generated",
                 statistics_kind="total_increasing",
                 new_entity_started_from_0=False,
             )
@@ -525,9 +525,9 @@ class TestStage3StatisticsSimulation(unittest.TestCase):
 
         ro = connect_readonly_sqlite(db_path)
         try:
-            create_stage3_statistics_view(
+            create_statistics_generated_view(
                 ro,
-                view_name="stage3_statistics",
+                view_name="statistics_generated",
                 source_table="statistics",
                 old_statistic_id="sensor.old",
                 new_statistic_id="sensor.new",
@@ -537,7 +537,7 @@ class TestStage3StatisticsSimulation(unittest.TestCase):
             )
 
             row = ro.execute(
-                "SELECT start_ts, state, min, mean, max FROM stage3_statistics WHERE statistic_id = ? AND start_ts = ?",
+                "SELECT start_ts, state, min, mean, max FROM statistics_generated WHERE statistic_id = ? AND start_ts = ?",
                 ("sensor.new", 10800.0),
             ).fetchone()
             self.assertIsNotNone(row)
@@ -597,12 +597,12 @@ class TestStage3StatisticsSimulation(unittest.TestCase):
 
         ro = connect_readonly_sqlite(db_path)
         try:
-            script = build_stage3_update_sql_script(
+            script = build_statistics_update_sql_script(
                 ro,
                 old_entity_id="sensor.old",
                 new_entity_id="sensor.new",
-                stats_view="stage3_statistics",
-                stats_st_view="stage3_statistics_short_term",
+                stats_view="statistics_generated",
+                stats_st_view="statistics_short_term_generated",
                 statistics_kind="total_increasing",
                 new_entity_started_from_0=False,
             )
