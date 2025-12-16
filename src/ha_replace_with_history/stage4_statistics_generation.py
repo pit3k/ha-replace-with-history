@@ -38,6 +38,8 @@ def run_statistics_generation(
     new_entity_started_from_0: bool,
     old_summary: dict[str, object],
     new_summary: dict[str, object],
+    report_stats: bool,
+    report_stats_short_term: bool,
     apply: bool,
     color: bool,
 ) -> Stage4Result:
@@ -155,28 +157,31 @@ def run_statistics_generation(
         return title + "\n" + render_simple_table(headers=headers, rows=condensed_rows, color=color, color_code=code)
 
     # Stage 5 (dry-run): compare current rows (would be deleted) vs generated rows (would be inserted).
-    # This runs even without --apply.
-    before_long_dry = snapshot_statistics_rows(conn, "statistics", new_entity_id, start_epoch_gt=cutoff_long)
-    after_long_dry = snapshot_statistics_rows(conn, generated_stats_view, new_entity_id, start_epoch_gt=cutoff_long)
-    before_short_dry = snapshot_statistics_rows(
-        conn, "statistics_short_term", new_entity_id, start_epoch_gt=cutoff_short
-    )
-    after_short_dry = snapshot_statistics_rows(conn, generated_st_view, new_entity_id, start_epoch_gt=cutoff_short)
-
-    planned_stage5_long = format_diff_condensed(
-        "Statistics changes (long-term):",
-        before_long_dry,
-        after_long_dry,
-        interval_seconds=3600,
-        code="33",
-    )
-    planned_stage5_short = format_diff_condensed(
-        "Statistics changes (short-term):",
-        before_short_dry,
-        after_short_dry,
-        interval_seconds=300,
-        code="33",
-    )
+    # This runs even without --apply, but can be disabled per table.
+    planned_stage5_long = ""
+    planned_stage5_short = ""
+    if report_stats:
+        before_long_dry = snapshot_statistics_rows(conn, "statistics", new_entity_id, start_epoch_gt=cutoff_long)
+        after_long_dry = snapshot_statistics_rows(conn, generated_stats_view, new_entity_id, start_epoch_gt=cutoff_long)
+        planned_stage5_long = format_diff_condensed(
+            "Statistics changes (long-term):",
+            before_long_dry,
+            after_long_dry,
+            interval_seconds=3600,
+            code="33",
+        )
+    if report_stats_short_term:
+        before_short_dry = snapshot_statistics_rows(
+            conn, "statistics_short_term", new_entity_id, start_epoch_gt=cutoff_short
+        )
+        after_short_dry = snapshot_statistics_rows(conn, generated_st_view, new_entity_id, start_epoch_gt=cutoff_short)
+        planned_stage5_short = format_diff_condensed(
+            "Statistics changes (short-term):",
+            before_short_dry,
+            after_short_dry,
+            interval_seconds=300,
+            code="33",
+        )
 
     sql_path = Path.cwd() / "update.sql"
     sql_script = build_statistics_update_sql_script(
@@ -197,10 +202,12 @@ def run_statistics_generation(
     applied_stage5 = ""
     if apply:
         # Snapshot pre-apply rows for Stage 5.
-        before_long = snapshot_statistics_rows(conn, "statistics", new_entity_id, start_epoch_gt=cutoff_long)
-        before_short = snapshot_statistics_rows(
-            conn, "statistics_short_term", new_entity_id, start_epoch_gt=cutoff_short
-        )
+        if report_stats:
+            before_long = snapshot_statistics_rows(conn, "statistics", new_entity_id, start_epoch_gt=cutoff_long)
+        if report_stats_short_term:
+            before_short = snapshot_statistics_rows(
+                conn, "statistics_short_term", new_entity_id, start_epoch_gt=cutoff_short
+            )
 
         try:
             apply_sql_script(db_path, sql_script)
@@ -210,44 +217,57 @@ def run_statistics_generation(
             applied_ok = True
             print(f"Stage 4 apply succeeded: updated {db_path}")
 
-    if applied_ok and before_long is not None:
+    if applied_ok and (before_long is not None or before_short is not None):
         after_conn = connect_readonly_sqlite(db_path)
         try:
-            after_long = snapshot_statistics_rows(after_conn, "statistics", new_entity_id, start_epoch_gt=cutoff_long)
-            after_short = snapshot_statistics_rows(
-                after_conn, "statistics_short_term", new_entity_id, start_epoch_gt=cutoff_short
-            )
+            after_long = None
+            after_short = None
+            if before_long is not None:
+                after_long = snapshot_statistics_rows(
+                    after_conn, "statistics", new_entity_id, start_epoch_gt=cutoff_long
+                )
+            if before_short is not None:
+                after_short = snapshot_statistics_rows(
+                    after_conn, "statistics_short_term", new_entity_id, start_epoch_gt=cutoff_short
+                )
         finally:
             after_conn.close()
 
-        applied_stage5_long = format_diff_condensed(
-            "Statistics changes (long-term):",
-            before_long,
-            after_long,
-            interval_seconds=3600,
-            code="33",
-        )
-        applied_stage5_short = ""
-        if before_short is not None:
-            applied_stage5_short = format_diff_condensed(
-                "Statistics changes (short-term):",
-                before_short,
-                after_short,
-                interval_seconds=300,
-                code="33",
+        applied_parts: list[str] = []
+        if before_long is not None and after_long is not None:
+            applied_parts.append(
+                format_diff_condensed(
+                    "Statistics changes (long-term):",
+                    before_long,
+                    after_long,
+                    interval_seconds=3600,
+                    code="33",
+                )
+            )
+        if before_short is not None and after_short is not None:
+            applied_parts.append(
+                format_diff_condensed(
+                    "Statistics changes (short-term):",
+                    before_short,
+                    after_short,
+                    interval_seconds=300,
+                    code="33",
+                )
             )
 
-        applied_stage5 = "".join([applied_stage5_long, applied_stage5_short])
+        applied_stage5 = "".join(applied_parts)
 
     # Generated statistics analysis
     reset_rows: list[dict[str, str]] = []
     if statistics_kind in {"total_increasing", "total"}:
-        reset_rows.extend(
-            collect_reset_events_statistics(conn, generated_stats_view, new_entity_id, state_class=statistics_kind)
-        )
-        reset_rows.extend(
-            collect_reset_events_statistics(conn, generated_st_view, new_entity_id, state_class=statistics_kind)
-        )
+        if report_stats:
+            reset_rows.extend(
+                collect_reset_events_statistics(conn, generated_stats_view, new_entity_id, state_class=statistics_kind)
+            )
+        if report_stats_short_term:
+            reset_rows.extend(
+                collect_reset_events_statistics(conn, generated_st_view, new_entity_id, state_class=statistics_kind)
+            )
 
     if reset_rows:
         print("Generated statistics reset events report:")
@@ -273,12 +293,14 @@ def run_statistics_generation(
         print(render_simple_table(headers=headers, rows=rows, color=color, color_code="35"), end="")
 
     gap_rows: list[dict[str, str]] = []
-    gap_rows.extend(
-        collect_missing_statistics_row_ranges(conn, generated_stats_view, new_entity_id, interval_seconds=3600)
-    )
-    gap_rows.extend(
-        collect_missing_statistics_row_ranges(conn, generated_st_view, new_entity_id, interval_seconds=300)
-    )
+    if report_stats:
+        gap_rows.extend(
+            collect_missing_statistics_row_ranges(conn, generated_stats_view, new_entity_id, interval_seconds=3600)
+        )
+    if report_stats_short_term:
+        gap_rows.extend(
+            collect_missing_statistics_row_ranges(conn, generated_st_view, new_entity_id, interval_seconds=300)
+        )
     if gap_rows:
         print("Generated statistics missing-rows report:")
         gap_rows.sort(key=lambda r: float(r.get("gap_start_epoch", "inf")))
@@ -286,41 +308,53 @@ def run_statistics_generation(
         rows = [[r["entity"], r["table"], r["gap"]] for r in gap_rows]
         print(render_simple_table(headers=headers, rows=rows, color=color, color_code="36"), end="")
 
-    print("Generated statistics row counts report:")
-    try:
-        n_long = conn.execute(f"SELECT COUNT(*) AS c FROM {generated_stats_view}").fetchone()["c"]
-        n_short = conn.execute(f"SELECT COUNT(*) AS c FROM {generated_st_view}").fetchone()["c"]
-    except Exception:
+    stats_preview: list[dict[str, str]] = []
+    st_preview: list[dict[str, str]] = []
+
+    if report_stats or report_stats_short_term:
+        print("Generated statistics row counts report:")
         n_long = None
         n_short = None
+        try:
+            if report_stats:
+                n_long = conn.execute(f"SELECT COUNT(*) AS c FROM {generated_stats_view}").fetchone()["c"]
+            if report_stats_short_term:
+                n_short = conn.execute(f"SELECT COUNT(*) AS c FROM {generated_st_view}").fetchone()["c"]
+        except Exception:
+            n_long = None
+            n_short = None
 
-    rows = [
-        ["statistics", "" if n_long is None else str(n_long)],
-        ["statistics_short_term", "" if n_short is None else str(n_short)],
-    ]
-    print(render_simple_table(headers=["table", "row_count"], rows=rows, color=color, color_code="32"), end="")
+        rows: list[list[str]] = []
+        if report_stats:
+            rows.append(["statistics", "" if n_long is None else str(n_long)])
+        if report_stats_short_term:
+            rows.append(["statistics_short_term", "" if n_short is None else str(n_short)])
+        if rows:
+            print(render_simple_table(headers=["table", "row_count"], rows=rows, color=color, color_code="32"), end="")
 
-    stats_preview = collect_generated_statistics_preview_rows(
-        conn,
-        source_table="statistics",
-        old_entity_id=old_entity_id,
-        new_entity_id=new_entity_id,
-        generated_view=generated_stats_view,
-        first_generated=3,
-        last_generated=3,
-    )
-    st_preview = collect_generated_statistics_preview_rows(
-        conn,
-        source_table="statistics_short_term",
-        old_entity_id=old_entity_id,
-        new_entity_id=new_entity_id,
-        generated_view=generated_st_view,
-        first_generated=3,
-        last_generated=3,
-    )
+        if report_stats:
+            stats_preview = collect_generated_statistics_preview_rows(
+                conn,
+                source_table="statistics",
+                old_entity_id=old_entity_id,
+                new_entity_id=new_entity_id,
+                generated_view=generated_stats_view,
+                first_generated=3,
+                last_generated=3,
+            )
+        if report_stats_short_term:
+            st_preview = collect_generated_statistics_preview_rows(
+                conn,
+                source_table="statistics_short_term",
+                old_entity_id=old_entity_id,
+                new_entity_id=new_entity_id,
+                generated_view=generated_st_view,
+                first_generated=3,
+                last_generated=3,
+            )
 
-    if stats_preview or st_preview:
-        print("Generated statistics rows report (sample):")
+        if stats_preview or st_preview:
+            print("Generated statistics rows report (sample):")
 
     def _print_preview(title: str, preview: list[dict[str, str]]) -> None:
         if not preview:
@@ -334,8 +368,10 @@ def run_statistics_generation(
             table_rows = [[r["ts"], r.get("min", ""), r.get("mean", ""), r.get("max", "")] for r in preview]
         print(render_simple_table(headers=headers, rows=table_rows, color=color, color_code="32"), end="")
 
-    _print_preview("=== GENERATED PREVIEW: statistics ===", stats_preview)
-    _print_preview("=== GENERATED PREVIEW: statistics_short_term ===", st_preview)
+    if report_stats:
+        _print_preview("=== GENERATED PREVIEW: statistics ===", stats_preview)
+    if report_stats_short_term:
+        _print_preview("=== GENERATED PREVIEW: statistics_short_term ===", st_preview)
 
     # Print Stage 5 reports last.
     if planned_stage5_long or planned_stage5_short:

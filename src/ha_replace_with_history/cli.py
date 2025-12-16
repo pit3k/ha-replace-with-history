@@ -51,6 +51,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     p.add_argument(
+        "--report-stats",
+        type=parse_bool,
+        default=True,
+        metavar="{true|false}",
+        help="If true (default), print long-term statistics reports.",
+    )
+
+    p.add_argument(
+        "--report-stats-short-term",
+        type=parse_bool,
+        default=True,
+        metavar="{true|false}",
+        help="If true (default), print short-term statistics reports.",
+    )
+
+    p.add_argument(
         "--apply",
         action="store_true",
         help=(
@@ -119,6 +135,8 @@ def main(argv: list[str] | None = None) -> int:
             new_state_class=stage1.new_state_class,
             old_summary=old_summary,
             new_summary=new_summary,
+            report_stats=args.report_stats,
+            report_stats_short_term=args.report_stats_short_term,
             tick=tick,
             color=use_color,
         )
@@ -133,6 +151,8 @@ def main(argv: list[str] | None = None) -> int:
             new_entity_started_from_0=args.new_entity_started_from_0,
             old_summary=old_summary,
             new_summary=new_summary,
+            report_stats=args.report_stats,
+            report_stats_short_term=args.report_stats_short_term,
             apply=args.apply,
             color=use_color,
         )

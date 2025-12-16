@@ -19,23 +19,32 @@ def run_statistics_analysis(
     new_state_class: str | None,
     old_summary: dict[str, object],
     new_summary: dict[str, object],
+    report_stats: bool,
+    report_stats_short_term: bool,
     tick: str,
     color: bool,
 ) -> None:
     print("*** Stage 3: Statistics analysis")
 
+    if not report_stats and not report_stats_short_term:
+        print("Stage 3 skipped: statistics reporting disabled.")
+        return
+
     print("Statistics analysis report:")
+    old_payload: dict[str, object] = {}
+    new_payload: dict[str, object] = {}
+    if report_stats:
+        old_payload["statistics"] = old_summary.get("statistics")
+        new_payload["statistics"] = new_summary.get("statistics")
+    if report_stats_short_term:
+        old_payload["statistics_short_term"] = old_summary.get("statistics_short_term")
+        new_payload["statistics_short_term"] = new_summary.get("statistics_short_term")
+
     stats_report = render_entity_registry_report(
         old_entity_id=old_entity_id,
         new_entity_id=new_entity_id,
-        old={
-            "statistics": old_summary.get("statistics"),
-            "statistics_short_term": old_summary.get("statistics_short_term"),
-        },
-        new={
-            "statistics": new_summary.get("statistics"),
-            "statistics_short_term": new_summary.get("statistics_short_term"),
-        },
+        old=old_payload,
+        new=new_payload,
         tick=tick,
         color=color,
     )
@@ -52,20 +61,28 @@ def run_statistics_analysis(
         state_reset_rows.extend(collect_reset_events_states(conn, new_entity_id, state_class=new_state_class))
 
     stats_reset_rows: list[dict[str, str]] = []
-    if old_total_like:
-        stats_reset_rows.extend(
-            collect_reset_events_statistics(conn, "statistics", old_entity_id, state_class=old_state_class)
-        )
-        stats_reset_rows.extend(
-            collect_reset_events_statistics(conn, "statistics_short_term", old_entity_id, state_class=old_state_class)
-        )
-    if new_total_like:
-        stats_reset_rows.extend(
-            collect_reset_events_statistics(conn, "statistics", new_entity_id, state_class=new_state_class)
-        )
-        stats_reset_rows.extend(
-            collect_reset_events_statistics(conn, "statistics_short_term", new_entity_id, state_class=new_state_class)
-        )
+    if report_stats:
+        if old_total_like:
+            stats_reset_rows.extend(
+                collect_reset_events_statistics(conn, "statistics", old_entity_id, state_class=old_state_class)
+            )
+        if new_total_like:
+            stats_reset_rows.extend(
+                collect_reset_events_statistics(conn, "statistics", new_entity_id, state_class=new_state_class)
+            )
+    if report_stats_short_term:
+        if old_total_like:
+            stats_reset_rows.extend(
+                collect_reset_events_statistics(
+                    conn, "statistics_short_term", old_entity_id, state_class=old_state_class
+                )
+            )
+        if new_total_like:
+            stats_reset_rows.extend(
+                collect_reset_events_statistics(
+                    conn, "statistics_short_term", new_entity_id, state_class=new_state_class
+                )
+            )
 
     # Print two combined reset tables:
     # 1) states + statistics
@@ -107,21 +124,27 @@ def run_statistics_analysis(
                 )
             print(render_simple_table(headers=headers, rows=rows, color=color, color_code="35"), end="")
 
-        print_combined(
-            "Reset events report (states + statistics):",
-            [*state_reset_rows, *stats_rows],
-        )
-        print_combined(
-            "Reset events report (states + statistics_short_term):",
-            [*state_reset_rows, *st_rows],
-        )
+        if report_stats:
+            print_combined(
+                "Reset events report (states + statistics):",
+                [*state_reset_rows, *stats_rows],
+            )
+        if report_stats_short_term:
+            print_combined(
+                "Reset events report (states + statistics_short_term):",
+                [*state_reset_rows, *st_rows],
+            )
 
     gap_rows: list[dict[str, str]] = []
     for entity_id in (old_entity_id, new_entity_id):
-        gap_rows.extend(collect_missing_statistics_row_ranges(conn, "statistics", entity_id, interval_seconds=3600))
-        gap_rows.extend(
-            collect_missing_statistics_row_ranges(conn, "statistics_short_term", entity_id, interval_seconds=300)
-        )
+        if report_stats:
+            gap_rows.extend(
+                collect_missing_statistics_row_ranges(conn, "statistics", entity_id, interval_seconds=3600)
+            )
+        if report_stats_short_term:
+            gap_rows.extend(
+                collect_missing_statistics_row_ranges(conn, "statistics_short_term", entity_id, interval_seconds=300)
+            )
 
     if gap_rows:
         print("Missing statistics rows report:")
