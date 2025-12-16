@@ -1639,6 +1639,82 @@ def build_statistics_change_report_with_epochs(
     return headers, out
 
 
+def condense_statistics_change_report_rows(
+    headers: list[str],
+    epoch_rows: list[tuple[float, list[str]]],
+    *,
+    interval_seconds: int,
+    trivial_columns: tuple[str, ...] = ("sum", "created_ts"),
+) -> list[list[str]]:
+    """Condense Stage 5 diff rows by contiguous time ranges.
+
+    Rules:
+    - Split into contiguous blocks where successive start epochs differ by exactly interval_seconds.
+    - For each block, always include:
+      - first 3 rows
+      - last 3 rows
+      - any row with a non-trivial change (i.e. a change in a column other than trivial_columns)
+    - Replace omitted middle spans with a single '...' row.
+    """
+    if not epoch_rows:
+        return []
+
+    def is_contiguous(prev_epoch: float, next_epoch: float) -> bool:
+        return abs((next_epoch - prev_epoch) - float(interval_seconds)) < 1e-6
+
+    # Column indexes we consider "non-trivial".
+    trivial_set = set(trivial_columns)
+    nontrivial_idx: list[int] = []
+    for i, h in enumerate(headers):
+        if i == 0:
+            continue  # start_dt
+        if h in trivial_set:
+            continue
+        nontrivial_idx.append(i)
+
+    def row_is_nontrivial(row: list[str]) -> bool:
+        for i in nontrivial_idx:
+            if i < len(row) and row[i] not in ("", "(none)"):
+                return True
+        return False
+
+    # Build contiguous blocks.
+    blocks: list[list[tuple[float, list[str]]]] = []
+    cur: list[tuple[float, list[str]]] = [epoch_rows[0]]
+    for e, r in epoch_rows[1:]:
+        prev_e = cur[-1][0]
+        if is_contiguous(prev_e, e):
+            cur.append((e, r))
+        else:
+            blocks.append(cur)
+            cur = [(e, r)]
+    blocks.append(cur)
+
+    out: list[list[str]] = []
+    dots_row = ["..."] + ["..."] * (len(headers) - 1)
+
+    for b in blocks:
+        n = len(b)
+        if n <= 6:
+            out.extend([r for _, r in b])
+            continue
+
+        include: set[int] = set(range(0, 3)) | set(range(n - 3, n))
+        for idx, (_e, r) in enumerate(b):
+            if row_is_nontrivial(r):
+                include.add(idx)
+
+        include_sorted = sorted(include)
+        last_idx: int | None = None
+        for idx in include_sorted:
+            if last_idx is not None and idx - last_idx > 1:
+                out.append(dots_row)
+            out.append(b[idx][1])
+            last_idx = idx
+
+    return out
+
+
 def collect_reset_events_states(
     conn: sqlite3.Connection,
     entity_id: str,

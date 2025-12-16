@@ -9,6 +9,7 @@ from .db_summary import (
     apply_sql_script,
     build_statistics_change_report,
     build_statistics_change_report_with_epochs,
+    condense_statistics_change_report_rows,
     build_statistics_update_sql_script,
     collect_generated_statistics_preview_rows,
     collect_missing_statistics_row_ranges,
@@ -107,41 +108,6 @@ def run_statistics_generation(
         print(f"Stage 4 skipped: {exc}")
         return Stage4Result(ran=False, sql_path=None)
 
-    def _condense_epoch_rows(
-        headers: list[str],
-        epoch_rows: list[tuple[float, list[str]]],
-        *,
-        interval_seconds: int,
-    ) -> list[list[str]]:
-        if not epoch_rows:
-            return []
-
-        def is_contiguous(prev_epoch: float, next_epoch: float) -> bool:
-            return abs((next_epoch - prev_epoch) - float(interval_seconds)) < 1e-6
-
-        blocks: list[list[tuple[float, list[str]]]] = []
-        cur: list[tuple[float, list[str]]] = [epoch_rows[0]]
-        for e, r in epoch_rows[1:]:
-            prev_e = cur[-1][0]
-            if is_contiguous(prev_e, e):
-                cur.append((e, r))
-            else:
-                blocks.append(cur)
-                cur = [(e, r)]
-        blocks.append(cur)
-
-        out: list[list[str]] = []
-        dots_row = ["..."] + ["..."] * (len(headers) - 1)
-
-        for b in blocks:
-            if len(b) <= 6:
-                out.extend([r for _, r in b])
-                continue
-            out.extend([r for _, r in b[:3]])
-            out.append(dots_row)
-            out.extend([r for _, r in b[-3:]])
-        return out
-
     def format_diff_condensed(
         title: str,
         before_snap,
@@ -167,7 +133,12 @@ def run_statistics_generation(
         )
         if len(headers) <= 1 or not epoch_rows:
             return ""
-        condensed_rows = _condense_epoch_rows(headers, epoch_rows, interval_seconds=interval_seconds)
+        condensed_rows = condense_statistics_change_report_rows(
+            headers,
+            epoch_rows,
+            interval_seconds=interval_seconds,
+            trivial_columns=("sum", "created_ts"),
+        )
         if not condensed_rows:
             return ""
         return title + "\n" + render_simple_table(headers=headers, rows=condensed_rows, color=color, color_code=code)

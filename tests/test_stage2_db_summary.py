@@ -7,10 +7,12 @@ from typing import cast
 
 from ha_replace_with_history.db_summary import (
     build_statistics_change_report,
+    build_statistics_change_report_with_epochs,
     collect_last_reset_rows,
     collect_missing_statistics_row_ranges,
     collect_reset_events_statistics,
     collect_reset_events_states,
+    condense_statistics_change_report_rows,
     connect_readonly_sqlite,
     snapshot_statistics_rows,
     summarize_all,
@@ -600,6 +602,39 @@ class TestStage2DbSummary(unittest.TestCase):
         self.assertEqual(r3600[sum_idx], "20.0 -> (none)")
         self.assertEqual(r7200[state_idx], "(none) -> 3.0")
         self.assertEqual(r7200[sum_idx], "(none) -> 30.0")
+
+    def test_stage5_condense_keeps_nontrivial_rows(self) -> None:
+        # Build a long contiguous range where all rows differ in sum/created_ts,
+        # but one middle row also differs in state. Condensing must keep that row.
+        before: dict[float, dict[str, object]] = {}
+        after: dict[float, dict[str, object]] = {}
+        for i in range(10):
+            ts = float(i * 3600)
+            before[ts] = {"start_ts": ts, "state": 1.0, "sum": 10.0 + i, "created_ts": 1.0}
+            after_state = 1.0
+            if i == 5:
+                after_state = 2.0
+            after[ts] = {"start_ts": ts, "state": after_state, "sum": 100.0 + i, "created_ts": 2.0}
+
+        headers, epoch_rows = build_statistics_change_report_with_epochs(
+            before=before,
+            after=after,
+            before_ts_col="start_ts",
+            before_ts_is_seconds=True,
+            after_ts_col="start_ts",
+            after_ts_is_seconds=True,
+        )
+        condensed = condense_statistics_change_report_rows(
+            headers,
+            epoch_rows,
+            interval_seconds=3600,
+            trivial_columns=("sum", "created_ts"),
+        )
+
+        # Expect an ellipsis (we condensed), and the middle non-trivial row preserved.
+        self.assertTrue(any(r and r[0] == "..." for r in condensed))
+        middle_dt = self._fmt_local(5 * 3600.0)
+        self.assertTrue(any(r and r[0] == middle_dt for r in condensed))
 
     def test_total_resets_use_last_reset_change_in_statistics(self) -> None:
         db_path = self._make_db()
