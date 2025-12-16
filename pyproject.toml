@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ha-replace-with-history"
+version = "0.1.0"
+description = "CLI tool for checking/fixing Home Assistant entity history (stage 1: entity registry report)."
+requires-python = ">=3.9"
+readme = "README.md"
+
+[project.scripts]
+ha-replace-with-history = "ha_replace_with_history.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

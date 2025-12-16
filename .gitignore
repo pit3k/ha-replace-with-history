@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+
+# Home Assistant local data (DO NOT COMMIT)
+.storage/
+home-assistant_v2.db
+home-assistant_v2.db-wal
+home-assistant_v2.db-shm
+
+# Stage 3 generated SQL artifact (written to CWD)
+update.sql

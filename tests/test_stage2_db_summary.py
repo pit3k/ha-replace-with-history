@@ -1,0 +1,374 @@
+import sqlite3
+import tempfile
+import unittest
+from datetime import datetime, timezone
+from pathlib import Path
+
+from ha_replace_with_history.db_summary import (
+    collect_last_reset_rows,
+    collect_missing_statistics_row_ranges,
+    collect_reset_events_statistics,
+    collect_reset_events_states,
+    connect_readonly_sqlite,
+    summarize_all,
+    summarize_statistics,
+    summarize_states,
+)
+
+
+class TestStage2DbSummary(unittest.TestCase):
+    def _fmt_local(self, ts: float) -> str:
+        return datetime.fromtimestamp(ts, tz=timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+
+    def _make_db(self) -> Path:
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
+        tmp.close()
+        return Path(tmp.name)
+
+    def test_states_legacy_schema(self) -> None:
+        db_path = self._make_db()
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute(
+                "CREATE TABLE states (entity_id TEXT, state TEXT, last_updated_ts REAL)"
+            )
+            conn.executemany(
+                "INSERT INTO states(entity_id, state, last_updated_ts) VALUES(?,?,?)",
+                [
+                    ("sensor.old", "1", 100.0),
+                    ("sensor.old", "", 200.0),
+                    ("sensor.old", None, 300.0),
+                ],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        ro = connect_readonly_sqlite(db_path)
+        try:
+            summary = summarize_states(ro, "sensor.old")
+        finally:
+            ro.close()
+
+        self.assertEqual(summary.row_count, 3)
+        self.assertEqual(summary.unavailable_count, 2)
+        self.assertEqual(summary.oldest_value, "1")
+        self.assertEqual(summary.latest_value, None)
+        self.assertEqual(summary.oldest_available_value, "1")
+        self.assertEqual(summary.latest_available_value, "1")
+        self.assertIsNotNone(summary.oldest_ts)
+        self.assertIsNotNone(summary.latest_ts)
+        # Runs are split by exact value (no <mixed>): empty-string and NULL are separate runs.
+        self.assertEqual(len(summary.unavailable_occurrences), 2)
+
+        run1 = summary.unavailable_occurrences[0]
+        self.assertEqual(run1.start_ts, self._fmt_local(200.0))
+        self.assertEqual(run1.end_ts, self._fmt_local(200.0))
+        self.assertEqual(run1.count, 1)
+        self.assertEqual(run1.value, "")
+
+        run2 = summary.unavailable_occurrences[1]
+        self.assertEqual(run2.start_ts, self._fmt_local(300.0))
+        self.assertEqual(run2.end_ts, self._fmt_local(300.0))
+        self.assertEqual(run2.count, 1)
+        self.assertEqual(run2.value, "NULL")
+
+    def test_states_latest_unavailable_has_different_latest_available(self) -> None:
+        db_path = self._make_db()
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute(
+                "CREATE TABLE states (entity_id TEXT, state TEXT, last_updated_ts REAL)"
+            )
+            conn.executemany(
+                "INSERT INTO states(entity_id, state, last_updated_ts) VALUES(?,?,?)",
+                [
+                    ("sensor.x", "1", 100.0),
+                    ("sensor.x", "unavailable", 200.0),
+                ],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        ro = connect_readonly_sqlite(db_path)
+        try:
+            states = summarize_states(ro, "sensor.x")
+            all_summary = summarize_all(ro, "sensor.x")
+        finally:
+            ro.close()
+
+        self.assertEqual(states.latest_value, "unavailable")
+        self.assertEqual(states.latest_available_value, "1")
+        self.assertNotEqual(states.latest_available_ts, states.latest_ts)
+        self.assertEqual(states.unavailable_count, 1)
+        self.assertEqual(len(states.unavailable_occurrences), 1)
+        run = states.unavailable_occurrences[0]
+        self.assertEqual(run.start_ts, self._fmt_local(200.0))
+        self.assertEqual(run.end_ts, self._fmt_local(200.0))
+        self.assertEqual(run.count, 1)
+        self.assertEqual(run.value, "unavailable")
+
+        # summarize_all no longer embeds occurrences (printed as separate report)
+        self.assertNotIn("unavailable_occurrences", all_summary["states"])
+
+    def test_states_metadata_schema(self) -> None:
+        db_path = self._make_db()
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute(
+                "CREATE TABLE states_meta (metadata_id INTEGER PRIMARY KEY, entity_id TEXT)"
+            )
+            conn.execute(
+                "CREATE TABLE states (metadata_id INTEGER, state TEXT, last_updated_ts REAL)"
+            )
+            conn.execute("INSERT INTO states_meta(metadata_id, entity_id) VALUES(1, ?)", ("sensor.new",))
+            conn.executemany(
+                "INSERT INTO states(metadata_id, state, last_updated_ts) VALUES(?,?,?)",
+                [
+                    (1, "a", 10.0),
+                    (1, "b", 20.0),
+                ],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        ro = connect_readonly_sqlite(db_path)
+        try:
+            summary = summarize_states(ro, "sensor.new")
+        finally:
+            ro.close()
+
+        self.assertEqual(summary.row_count, 2)
+        self.assertEqual(summary.unavailable_count, 0)
+        self.assertEqual(summary.oldest_value, "a")
+        self.assertEqual(summary.latest_value, "b")
+        self.assertEqual(summary.oldest_available_value, "a")
+        self.assertEqual(summary.latest_available_value, "b")
+        self.assertEqual(len(summary.unavailable_occurrences), 0)
+
+    def test_statistics_metadata_schema(self) -> None:
+        db_path = self._make_db()
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute(
+                "CREATE TABLE statistics_meta (id INTEGER PRIMARY KEY, statistic_id TEXT)"
+            )
+            conn.execute(
+                "CREATE TABLE statistics (metadata_id INTEGER, start_ts REAL, mean REAL, sum REAL, last_reset_ts REAL)"
+            )
+            conn.execute(
+                "CREATE TABLE statistics_short_term (metadata_id INTEGER, start_ts REAL, mean REAL)"
+            )
+            conn.execute("INSERT INTO statistics_meta(id, statistic_id) VALUES(7, ?)", ("sensor.stat",))
+            conn.executemany(
+                "INSERT INTO statistics(metadata_id, start_ts, mean, sum, last_reset_ts) VALUES(?,?,?,?,?)",
+                [
+                    (7, 1000.0, 1.5, 10.0, None),
+                    (7, 2000.0, 2.5, 20.0, 1500.0),
+                ],
+            )
+            conn.executemany(
+                "INSERT INTO statistics_short_term(metadata_id, start_ts, mean) VALUES(?,?,?)",
+                [
+                    (7, 3000.0, 3.5),
+                ],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        ro = connect_readonly_sqlite(db_path)
+        try:
+            summary = summarize_statistics(ro, "statistics", "sensor.stat")
+            st_summary = summarize_statistics(ro, "statistics_short_term", "sensor.stat")
+            all_summary = summarize_all(ro, "sensor.stat")
+        finally:
+            ro.close()
+
+        self.assertEqual(summary.row_count, 2)
+        self.assertEqual(summary.unavailable_count, 0)
+        self.assertEqual(summary.oldest_value, "1.5")
+        self.assertEqual(summary.latest_value, "2.5")
+        self.assertEqual(summary.oldest_available_value, "1.5")
+        self.assertEqual(summary.latest_available_value, "2.5")
+        self.assertEqual(summary.oldest_sum, "10.0")
+        self.assertEqual(summary.latest_sum, "20.0")
+        self.assertEqual(st_summary.row_count, 1)
+        self.assertEqual(st_summary.latest_value, "3.5")
+
+        self.assertIn("states", all_summary)
+        self.assertIn("statistics", all_summary)
+        self.assertIn("statistics_short_term", all_summary)
+
+        # total_increasing formatting includes sum in parentheses for statistics
+        ro = connect_readonly_sqlite(db_path)
+        try:
+            ti = summarize_all(ro, "sensor.stat", total_increasing=True)
+        finally:
+            ro.close()
+        self.assertEqual(ti["statistics"]["earliest"]["value"], "1.5 (10.0)")
+        self.assertEqual(ti["statistics"]["latest"]["value"], "2.5 (20.0)")
+
+        # last_reset rows are collected
+        ro = connect_readonly_sqlite(db_path)
+        try:
+            lr = collect_last_reset_rows(ro, "sensor.stat")
+        finally:
+            ro.close()
+        self.assertEqual(len(lr), 1)
+        self.assertEqual(lr[0]["table"], "statistics")
+
+    def test_reset_events_states_and_statistics(self) -> None:
+        db_path = self._make_db()
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute("CREATE TABLE states (entity_id TEXT, state TEXT, last_updated_ts REAL)")
+            conn.executemany(
+                "INSERT INTO states(entity_id, state, last_updated_ts) VALUES(?,?,?)",
+                [
+                    ("sensor.r", "5", 100.0),
+                    ("sensor.r", "6", 200.0),
+                    ("sensor.r", "1", 300.0),
+                ],
+            )
+
+            conn.execute("CREATE TABLE statistics_meta (id INTEGER PRIMARY KEY, statistic_id TEXT)")
+            conn.execute("CREATE TABLE statistics (metadata_id INTEGER, start_ts REAL, sum REAL)")
+            conn.execute("INSERT INTO statistics_meta(id, statistic_id) VALUES(1, ?)", ("sensor.r",))
+            conn.executemany(
+                "INSERT INTO statistics(metadata_id, start_ts, sum) VALUES(?,?,?)",
+                [
+                    (1, 10.0, 10.0),
+                    (1, 20.0, 11.0),
+                    (1, 30.0, 2.0),
+                ],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        ro = connect_readonly_sqlite(db_path)
+        try:
+            s_resets = collect_reset_events_states(ro, "sensor.r")
+            st_resets = collect_reset_events_statistics(ro, "statistics", "sensor.r")
+        finally:
+            ro.close()
+
+        self.assertEqual(len(s_resets), 1)
+        self.assertEqual(s_resets[0]["before"], f"{self._fmt_local(200.0)} (6)")
+        self.assertEqual(s_resets[0]["after"], f"{self._fmt_local(300.0)} (1)")
+
+        self.assertEqual(len(st_resets), 1)
+        self.assertEqual(st_resets[0]["before"], f"{self._fmt_local(20.0)} (11.0)")
+        self.assertEqual(st_resets[0]["after"], f"{self._fmt_local(30.0)} (2.0)")
+
+    def test_reset_events_statistics_prefers_state_over_sum(self) -> None:
+        db_path = self._make_db()
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute("CREATE TABLE statistics_meta (id INTEGER PRIMARY KEY, statistic_id TEXT)")
+            # Both columns exist; sum stays monotonic but state resets.
+            conn.execute("CREATE TABLE statistics (metadata_id INTEGER, start_ts REAL, state REAL, sum REAL)")
+            conn.execute("INSERT INTO statistics_meta(id, statistic_id) VALUES(1, ?)", ("sensor.r",))
+            conn.executemany(
+                "INSERT INTO statistics(metadata_id, start_ts, state, sum) VALUES(?,?,?,?)",
+                [
+                    (1, 10.0, 5.0, 100.0),
+                    (1, 20.0, 6.0, 110.0),
+                    (1, 30.0, 1.0, 120.0),
+                ],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        ro = connect_readonly_sqlite(db_path)
+        try:
+            resets = collect_reset_events_statistics(ro, "statistics", "sensor.r")
+        finally:
+            ro.close()
+
+        self.assertEqual(len(resets), 1)
+        self.assertEqual(resets[0]["before"], f"{self._fmt_local(20.0)} (6.0)")
+        self.assertEqual(resets[0]["after"], f"{self._fmt_local(30.0)} (1.0)")
+
+    def test_missing_statistics_row_ranges(self) -> None:
+        db_path = self._make_db()
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute("CREATE TABLE statistics_meta (id INTEGER PRIMARY KEY, statistic_id TEXT)")
+            conn.execute("CREATE TABLE statistics (metadata_id INTEGER, start_ts REAL, state REAL, sum REAL)")
+            conn.execute("CREATE TABLE statistics_short_term (metadata_id INTEGER, start_ts REAL, state REAL, sum REAL)")
+            conn.execute("INSERT INTO statistics_meta(id, statistic_id) VALUES(1, ?)", ("sensor.gap",))
+
+            # statistics (1h interval): gap between 2000 and 9200 => missing 1 row (5600)
+            conn.executemany(
+                "INSERT INTO statistics(metadata_id, start_ts, state, sum) VALUES(?,?,?,?)",
+                [
+                    (1, 2000.0, 1.0, 10.0),
+                    (1, 5600.0, 2.0, 20.0),
+                    (1, 9200.0, 3.0, 30.0),
+                ],
+            )
+
+            # statistics_short_term (5m interval): gap between 1000 and 1600 => missing 1 row (1300)
+            conn.executemany(
+                "INSERT INTO statistics_short_term(metadata_id, start_ts, state, sum) VALUES(?,?,?,?)",
+                [
+                    (1, 1000.0, 5.0, 50.0),
+                    (1, 1300.0, 6.0, 60.0),
+                    (1, 1600.0, 7.0, 70.0),
+                ],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        ro = connect_readonly_sqlite(db_path)
+        try:
+            gaps_stats = collect_missing_statistics_row_ranges(ro, "statistics", "sensor.gap", interval_seconds=3600)
+            gaps_st = collect_missing_statistics_row_ranges(
+                ro, "statistics_short_term", "sensor.gap", interval_seconds=300
+            )
+        finally:
+            ro.close()
+
+        # No gaps: we inserted all expected rows above.
+        self.assertEqual(gaps_stats, [])
+        self.assertEqual(gaps_st, [])
+
+        # Now create a gap by removing the middle rows.
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute("DELETE FROM statistics WHERE start_ts = ?", (5600.0,))
+            conn.execute("DELETE FROM statistics_short_term WHERE start_ts = ?", (1300.0,))
+            conn.commit()
+        finally:
+            conn.close()
+
+        ro = connect_readonly_sqlite(db_path)
+        try:
+            gaps_stats = collect_missing_statistics_row_ranges(ro, "statistics", "sensor.gap", interval_seconds=3600)
+            gaps_st = collect_missing_statistics_row_ranges(
+                ro, "statistics_short_term", "sensor.gap", interval_seconds=300
+            )
+        finally:
+            ro.close()
+
+        self.assertEqual(len(gaps_stats), 1)
+        self.assertEqual(gaps_stats[0]["entity"], "sensor.gap")
+        self.assertEqual(gaps_stats[0]["table"], "statistics")
+        self.assertEqual(
+            gaps_stats[0]["gap"],
+            f"{self._fmt_local(2000.0)} (1.0/10.0) - {self._fmt_local(9200.0)} (3.0/30.0) [1 rows]",
+        )
+
+        self.assertEqual(len(gaps_st), 1)
+        self.assertEqual(gaps_st[0]["entity"], "sensor.gap")
+        self.assertEqual(gaps_st[0]["table"], "statistics_short_term")
+        self.assertEqual(
+            gaps_st[0]["gap"],
+            f"{self._fmt_local(1000.0)} (5.0/50.0) - {self._fmt_local(1600.0)} (7.0/70.0) [1 rows]",
+        )
