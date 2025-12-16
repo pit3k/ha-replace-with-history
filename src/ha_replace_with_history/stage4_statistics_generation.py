@@ -43,15 +43,19 @@ def run_statistics_generation(
 
     old_total_increasing = old_state_class == "total_increasing"
     new_total_increasing = new_state_class == "total_increasing"
+    old_total = old_state_class == "total"
+    new_total = new_state_class == "total"
     old_measurement = old_state_class == "measurement"
     new_measurement = new_state_class == "measurement"
 
     if old_total_increasing and new_total_increasing:
         statistics_kind = "total_increasing"
+    elif old_total and new_total:
+        statistics_kind = "total"
     elif old_measurement and new_measurement:
         statistics_kind = "measurement"
     else:
-        print("Stage 4 skipped: both entities must be total_increasing or measurement (and match).")
+        print("Stage 4 skipped: both entities must be total_increasing, total, or measurement (and match).")
         return Stage4Result(ran=False, sql_path=None)
 
     # Preconditions:
@@ -117,12 +121,12 @@ def run_statistics_generation(
 
     # Generated statistics analysis
     reset_rows: list[dict[str, str]] = []
-    if statistics_kind == "total_increasing":
+    if statistics_kind in {"total_increasing", "total"}:
         reset_rows.extend(
-            collect_reset_events_statistics(conn, generated_stats_view, new_entity_id, state_class="total_increasing")
+            collect_reset_events_statistics(conn, generated_stats_view, new_entity_id, state_class=statistics_kind)
         )
         reset_rows.extend(
-            collect_reset_events_statistics(conn, generated_st_view, new_entity_id, state_class="total_increasing")
+            collect_reset_events_statistics(conn, generated_st_view, new_entity_id, state_class=statistics_kind)
         )
 
     if reset_rows:
@@ -202,7 +206,7 @@ def run_statistics_generation(
         if not preview:
             return
         print(title)
-        if statistics_kind == "total_increasing":
+        if statistics_kind in {"total_increasing", "total"}:
             headers = ["ts", "state", "sum"]
             table_rows = [[r["ts"], r["state"], r["sum"]] for r in preview]
         else:

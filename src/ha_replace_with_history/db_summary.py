@@ -956,15 +956,19 @@ def build_statistics_generated_view_sql(
 
     stats_state_sel = "t.state" if "state" in s_cols else "NULL"
     stats_sum_sel = "t.sum" if "sum" in s_cols else "NULL"
+    stats_last_reset_sel = "t.last_reset" if "last_reset" in s_cols else "NULL"
+    stats_last_reset_ts_sel = "t.last_reset_ts" if "last_reset_ts" in s_cols else "NULL"
     stats_mean_sel = "t.mean" if "mean" in s_cols else "NULL"
     stats_min_sel = "t.min" if "min" in s_cols else "NULL"
     stats_max_sel = "t.max" if "max" in s_cols else "NULL"
     stats_created_sel = "t.created_ts" if "created_ts" in s_cols else "NULL"
 
-    if statistics_kind not in {"total_increasing", "measurement"}:
+    if statistics_kind not in {"total_increasing", "total", "measurement"}:
         raise DbSummaryError(f"Unsupported statistics_kind: {statistics_kind}")
 
-    if statistics_kind == "total_increasing":
+    total_like = statistics_kind in {"total_increasing", "total"}
+
+    if total_like:
         if "sum" in s_cols:
             base_sum_expr = "COALESCE((SELECT os.sum FROM old_stats os WHERE os.sum IS NOT NULL ORDER BY os.start_ts DESC LIMIT 1), 0.0)"
         else:
@@ -972,7 +976,7 @@ def build_statistics_generated_view_sql(
     else:
         base_sum_expr = "0.0"
 
-    first_dv_expr = "v" if (statistics_kind == "total_increasing" and new_entity_started_from_0) else "0.0"
+    first_dv_expr = "v" if (total_like and new_entity_started_from_0) else "0.0"
 
     if statistics_kind == "total_increasing":
         new_stats_cte = f"""
@@ -983,6 +987,26 @@ new_stats AS (
         start_ts,
         state,
         sum,
+        NULL AS last_reset,
+        NULL AS last_reset_ts,
+        NULL AS mean,
+        NULL AS min,
+        NULL AS max
+    FROM bucket_last
+    WHERE rn = 1
+)
+""".strip()
+    elif statistics_kind == "total":
+        new_stats_cte = f"""
+new_stats AS (
+    SELECT
+        {new_id_q} AS statistic_id,
+        CAST(strftime('%s','now') AS REAL) AS created_ts,
+        start_ts,
+        state,
+        sum,
+        last_reset,
+        last_reset_ts,
         NULL AS mean,
         NULL AS min,
         NULL AS max
@@ -1015,6 +1039,8 @@ new_stats AS (
         a.start_ts,
         l.state AS state,
         NULL AS sum,
+        NULL AS last_reset,
+        NULL AS last_reset_ts,
         a.mean AS mean,
         a.min AS min,
         a.max AS max
@@ -1023,6 +1049,27 @@ new_stats AS (
     WHERE l.rn = 1
 )
 """.strip()
+
+    # For statistics_kind=total we need a last_reset value from state attributes.
+    st_from_with_attrs = states_from_sql
+    last_reset_expr = "NULL"
+    if statistics_kind == "total":
+        have_attrs_json = "attributes" in st_cols
+        have_attrs_id = "attributes_id" in st_cols and _table_exists(conn, "state_attributes")
+        if have_attrs_id:
+            sa_cols = _columns(conn, "state_attributes")
+            if "attributes_id" in sa_cols and "shared_attrs" in sa_cols:
+                st_from_with_attrs = f"{states_from_sql} LEFT JOIN state_attributes sa ON sa.attributes_id = s.attributes_id"
+                if have_attrs_json:
+                    last_reset_expr = "COALESCE(json_extract(sa.shared_attrs, '$.last_reset'), json_extract(s.attributes, '$.last_reset'))"
+                else:
+                    last_reset_expr = "json_extract(sa.shared_attrs, '$.last_reset')"
+        elif have_attrs_json:
+            last_reset_expr = "json_extract(s.attributes, '$.last_reset')"
+
+    # Best-effort parse of ISO datetime strings into epoch seconds.
+    # Uses only the first 19 chars (YYYY-MM-DDTHH:MM:SS) and ignores timezone/microseconds.
+    last_reset_ts_expr = "CASE WHEN last_reset IS NULL OR TRIM(CAST(last_reset AS TEXT)) = '' THEN NULL ELSE CAST(strftime('%s', replace(substr(CAST(last_reset AS TEXT), 1, 19), 'T', ' ')) AS REAL) END"
 
     return f"""
 CREATE TEMP VIEW {view_name} AS
@@ -1034,6 +1081,8 @@ old_stats AS (
         {stats_epoch} AS start_ts,
         {stats_state_sel} AS state,
         {stats_sum_sel} AS sum
+        ,{stats_last_reset_sel} AS last_reset
+        ,{stats_last_reset_ts_sel} AS last_reset_ts
         ,{stats_mean_sel} AS mean
         ,{stats_min_sel} AS min
         ,{stats_max_sel} AS max
@@ -1046,14 +1095,16 @@ base AS (
 raw_states AS (
     SELECT
         {states_epoch} AS ts,
-        s.state AS raw_state
-    FROM {states_from_sql}
+        s.state AS raw_state,
+        {last_reset_expr} AS last_reset
+    FROM {st_from_with_attrs}
     WHERE {states_where_sql}
 ),
 num_states AS (
     SELECT
         ts,
-        CAST(raw_state AS REAL) AS v
+        CAST(raw_state AS REAL) AS v,
+        last_reset
     FROM raw_states
     WHERE raw_state IS NOT NULL
         AND TRIM(CAST(raw_state AS TEXT)) <> ''
@@ -1063,8 +1114,14 @@ deltas AS (
     SELECT
         ts,
         v,
+        last_reset,
         CASE
             WHEN LAG(v) OVER (ORDER BY ts) IS NULL THEN {first_dv_expr}
+            WHEN {sql_quote(statistics_kind)} = 'total'
+                 AND last_reset IS NOT NULL
+                 AND LAG(last_reset) OVER (ORDER BY ts) IS NOT NULL
+                 AND CAST(last_reset AS TEXT) <> CAST(LAG(last_reset) OVER (ORDER BY ts) AS TEXT)
+            THEN CASE WHEN v < 0 THEN 0.0 ELSE v END
             WHEN v - LAG(v) OVER (ORDER BY ts) < 0 THEN 0.0
             ELSE v - LAG(v) OVER (ORDER BY ts)
         END AS dv
@@ -1074,6 +1131,8 @@ cumulative AS (
     SELECT
         ts,
         v,
+        last_reset,
+        {last_reset_ts_expr} AS last_reset_ts,
         (SELECT base_sum FROM base) + SUM(dv) OVER (ORDER BY ts ROWS UNBOUNDED PRECEDING) AS sum_v,
         CAST(ts / {interval_seconds} AS INT) * {interval_seconds} AS bucket
     FROM deltas
@@ -1083,13 +1142,15 @@ bucket_last AS (
         bucket AS start_ts,
         v AS state,
         sum_v AS sum,
+        last_reset,
+        last_reset_ts,
         ROW_NUMBER() OVER (PARTITION BY bucket ORDER BY ts DESC) AS rn
     FROM cumulative
 ),
 {new_stats_cte}
-SELECT statistic_id, created_ts, start_ts, state, sum, mean, min, max FROM old_stats
+SELECT statistic_id, created_ts, start_ts, state, sum, last_reset, last_reset_ts, mean, min, max FROM old_stats
 UNION ALL
-SELECT statistic_id, created_ts, start_ts, state, sum, mean, min, max FROM new_stats;
+SELECT statistic_id, created_ts, start_ts, state, sum, last_reset, last_reset_ts, mean, min, max FROM new_stats;
 """.strip()
 
 
@@ -1152,6 +1213,12 @@ def build_statistics_update_sql_script(
         if "created_ts" in cols:
             dest_cols.append("created_ts")
             select_cols.append("COALESCE(created_ts, CAST(strftime('%s','now') AS REAL)) AS created_ts")
+
+        # Total-like reset tracking
+        for c in ("last_reset", "last_reset_ts"):
+            if c in cols:
+                dest_cols.append(c)
+                select_cols.append(c)
 
         # Measurement aggregates
         for c in ("min", "mean", "max"):

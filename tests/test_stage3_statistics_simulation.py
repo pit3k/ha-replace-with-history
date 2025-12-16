@@ -158,6 +158,99 @@ class TestStage3StatisticsSimulation(unittest.TestCase):
         finally:
             ro.close()
 
+    def test_stage4_total_generated_view_and_sql_script(self) -> None:
+        db_path = self._make_db()
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute(
+                "CREATE TABLE states (entity_id TEXT, state TEXT, last_updated_ts REAL, attributes TEXT)"
+            )
+            conn.execute(
+                "CREATE TABLE statistics (statistic_id TEXT, start_ts REAL, state REAL, sum REAL, last_reset TEXT, last_reset_ts REAL)"
+            )
+            conn.execute(
+                "CREATE TABLE statistics_short_term (statistic_id TEXT, start_ts REAL, state REAL, sum REAL, last_reset TEXT, last_reset_ts REAL)"
+            )
+
+            # Old entity has one historical statistics row.
+            conn.executemany(
+                "INSERT INTO statistics(statistic_id, start_ts, state, sum, last_reset, last_reset_ts) VALUES(?,?,?,?,?,?)",
+                [
+                    (
+                        "sensor.old",
+                        0.0,
+                        10.0,
+                        100.0,
+                        "2025-01-01T00:00:00+00:00",
+                        1735689600.0,
+                    )
+                ],
+            )
+
+            # New entity states start after old stats; last_reset changes should be reflected.
+            conn.executemany(
+                "INSERT INTO states(entity_id, state, last_updated_ts, attributes) VALUES(?,?,?,?)",
+                [
+                    (
+                        "sensor.new",
+                        "1",
+                        4000.0,
+                        '{"last_reset":"2025-01-02T00:00:00+00:00"}',
+                    ),
+                    (
+                        "sensor.new",
+                        "2",
+                        4100.0,
+                        '{"last_reset":"2025-01-02T00:00:00+00:00"}',
+                    ),
+                    (
+                        "sensor.new",
+                        "0.5",
+                        8000.0,
+                        '{"last_reset":"2025-01-03T00:00:00+00:00"}',
+                    ),
+                ],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        ro = connect_readonly_sqlite(db_path)
+        try:
+            create_statistics_generated_view(
+                ro,
+                view_name="statistics_generated",
+                source_table="statistics",
+                old_statistic_id="sensor.old",
+                new_statistic_id="sensor.new",
+                interval_seconds=3600,
+                statistics_kind="total",
+                new_entity_started_from_0=True,
+            )
+
+            # Generated rows should include last_reset for at least one bucket.
+            row = ro.execute(
+                "SELECT last_reset FROM statistics_generated WHERE statistic_id = ? AND start_ts > 0 ORDER BY start_ts ASC LIMIT 1",
+                ("sensor.new",),
+            ).fetchone()
+            self.assertIsNotNone(row)
+            self.assertIsNotNone(row[0])
+
+            script = build_statistics_update_sql_script(
+                ro,
+                old_entity_id="sensor.old",
+                new_entity_id="sensor.new",
+                stats_view="statistics_generated",
+                stats_st_view="statistics_short_term_generated",
+                statistics_kind="total",
+                new_entity_started_from_0=True,
+            )
+            # Ensure we populate last_reset columns when present.
+            self.assertIn("last_reset", script)
+            self.assertIn("last_reset_ts", script)
+        finally:
+            ro.close()
+
     def test_stage3_update_sql_script_metadata_schema(self) -> None:
         db_path = self._make_db()
         conn = sqlite3.connect(str(db_path))
