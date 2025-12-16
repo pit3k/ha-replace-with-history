@@ -1427,8 +1427,11 @@ def collect_reset_events_statistics(conn: sqlite3.Connection, table: str, statis
     else:
         select_expr = "COALESCE(" + ",".join(f"t.{c}" for c in prefer) + ")"
 
+    last_reset_col = _pick_first_present(cols, ["last_reset_ts", "last_reset"])
+    last_reset_sel = f"t.{last_reset_col}" if last_reset_col is not None else "NULL"
+
     rows = conn.execute(
-        f"SELECT t.{ts_col} AS ts, {select_expr} AS v FROM {from_sql} WHERE {where_sql} ORDER BY t.{ts_col} ASC",
+        f"SELECT t.{ts_col} AS ts, {select_expr} AS v, {last_reset_sel} AS lr FROM {from_sql} WHERE {where_sql} ORDER BY t.{ts_col} ASC",
         params,
     ).fetchall()
 
@@ -1450,11 +1453,19 @@ def collect_reset_events_statistics(conn: sqlite3.Connection, table: str, statis
             cur_epoch = _to_epoch_seconds(r["ts"], assume_seconds=ts_is_seconds)
             before_ts = prev_ts or ""
             before_val = prev_raw if prev_raw is not None else ""
+
+            lr_val = r["lr"]
+            if lr_val is None or last_reset_col is None:
+                last_reset = ""
+            else:
+                last_reset = _fmt_ts(lr_val, assume_seconds=last_reset_col.endswith("_ts")) or str(lr_val)
+
             out.append(
                 {
                     "entity": statistic_id,
                     "table": table,
                     "event_epoch": "" if cur_epoch is None else str(cur_epoch),
+                    "last_reset": last_reset,
                     "before": f"{before_ts} ({before_val})",
                     "after": f"{cur_ts} ({str(v)})",
                 }

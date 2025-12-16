@@ -5,6 +5,7 @@ import sqlite3
 from .db_summary import (
     collect_missing_statistics_row_ranges,
     collect_reset_events_statistics,
+    collect_reset_events_states,
 )
 from .report import render_entity_registry_report, render_simple_table
 
@@ -14,8 +15,8 @@ def run_statistics_analysis(
     *,
     old_entity_id: str,
     new_entity_id: str,
-    old_total_increasing: bool,
-    new_total_increasing: bool,
+    old_total_like: bool,
+    new_total_like: bool,
     old_summary: dict[str, object],
     new_summary: dict[str, object],
     tick: str,
@@ -40,20 +41,33 @@ def run_statistics_analysis(
     )
     print(stats_report, end="")
 
-    # Reset events only apply to total_increasing sensors.
-    reset_rows: list[dict[str, str]] = []
-    if old_total_increasing:
-        reset_rows.extend(collect_reset_events_statistics(conn, "statistics", old_entity_id))
-        reset_rows.extend(collect_reset_events_statistics(conn, "statistics_short_term", old_entity_id))
-    if new_total_increasing:
-        reset_rows.extend(collect_reset_events_statistics(conn, "statistics", new_entity_id))
-        reset_rows.extend(collect_reset_events_statistics(conn, "statistics_short_term", new_entity_id))
+    # Reset events apply to total-like sensors (total_increasing and total).
+    state_reset_rows: list[dict[str, str]] = []
+    if old_total_like:
+        state_reset_rows.extend(collect_reset_events_states(conn, old_entity_id))
+    if new_total_like:
+        state_reset_rows.extend(collect_reset_events_states(conn, new_entity_id))
 
-    if reset_rows:
-        print("Statistics reset events report:")
-        reset_rows.sort(key=lambda r: float(r.get("event_epoch", "inf") or "inf"))
+    if state_reset_rows:
+        print("State reset events report:")
+        state_reset_rows.sort(key=lambda r: float(r.get("event_epoch", "inf") or "inf"))
         headers = ["entity", "table", "before", "after"]
-        rows = [[r["entity"], r["table"], r["before"], r["after"]] for r in reset_rows]
+        rows = [[r["entity"], r["table"], r["before"], r["after"]] for r in state_reset_rows]
+        print(render_simple_table(headers=headers, rows=rows, color=color, color_code="35"), end="")
+
+    stats_reset_rows: list[dict[str, str]] = []
+    if old_total_like:
+        stats_reset_rows.extend(collect_reset_events_statistics(conn, "statistics", old_entity_id))
+        stats_reset_rows.extend(collect_reset_events_statistics(conn, "statistics_short_term", old_entity_id))
+    if new_total_like:
+        stats_reset_rows.extend(collect_reset_events_statistics(conn, "statistics", new_entity_id))
+        stats_reset_rows.extend(collect_reset_events_statistics(conn, "statistics_short_term", new_entity_id))
+
+    if stats_reset_rows:
+        print("Statistics reset events report:")
+        stats_reset_rows.sort(key=lambda r: float(r.get("event_epoch", "inf") or "inf"))
+        headers = ["entity", "table", "last_reset", "before", "after"]
+        rows = [[r["entity"], r["table"], r.get("last_reset", ""), r["before"], r["after"]] for r in stats_reset_rows]
         print(render_simple_table(headers=headers, rows=rows, color=color, color_code="35"), end="")
 
     gap_rows: list[dict[str, str]] = []

@@ -91,6 +91,8 @@ def main(argv: list[str] | None = None) -> int:
 
     old_total_increasing = stage1.old_state_class == "total_increasing"
     new_total_increasing = stage1.new_state_class == "total_increasing"
+    old_total_like = stage1.old_state_class in {"total_increasing", "total"}
+    new_total_like = stage1.new_state_class in {"total_increasing", "total"}
 
     db_exit: int = 0
     try:
@@ -115,8 +117,8 @@ def main(argv: list[str] | None = None) -> int:
             conn,
             old_entity_id=args.old_entity_id,
             new_entity_id=args.new_entity_id,
-            old_total_increasing=old_total_increasing,
-            new_total_increasing=new_total_increasing,
+            old_total_like=old_total_like,
+            new_total_like=new_total_like,
             old_summary=old_summary,
             new_summary=new_summary,
             tick=tick,

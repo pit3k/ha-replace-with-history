@@ -264,6 +264,38 @@ class TestStage2DbSummary(unittest.TestCase):
         self.assertEqual(st_resets[0]["before"], f"{self._fmt_local(20.0)} (11.0)")
         self.assertEqual(st_resets[0]["after"], f"{self._fmt_local(30.0)} (2.0)")
 
+    def test_reset_events_statistics_includes_last_reset_ts(self) -> None:
+        db_path = self._make_db()
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute("CREATE TABLE statistics_meta (id INTEGER PRIMARY KEY, statistic_id TEXT)")
+            conn.execute(
+                "CREATE TABLE statistics (metadata_id INTEGER, start_ts REAL, sum REAL, last_reset_ts REAL)"
+            )
+            conn.execute("INSERT INTO statistics_meta(id, statistic_id) VALUES(1, ?)", ("sensor.r",))
+            conn.executemany(
+                "INSERT INTO statistics(metadata_id, start_ts, sum, last_reset_ts) VALUES(?,?,?,?)",
+                [
+                    (1, 10.0, 10.0, None),
+                    (1, 20.0, 11.0, None),
+                    (1, 30.0, 2.0, 25.0),
+                ],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        ro = connect_readonly_sqlite(db_path)
+        try:
+            resets = collect_reset_events_statistics(ro, "statistics", "sensor.r")
+        finally:
+            ro.close()
+
+        self.assertEqual(len(resets), 1)
+        self.assertEqual(resets[0]["before"], f"{self._fmt_local(20.0)} (11.0)")
+        self.assertEqual(resets[0]["after"], f"{self._fmt_local(30.0)} (2.0)")
+        self.assertEqual(resets[0]["last_reset"], f"{self._fmt_local(25.0)}")
+
     def test_reset_events_statistics_prefers_state_over_sum(self) -> None:
         db_path = self._make_db()
         conn = sqlite3.connect(str(db_path))
