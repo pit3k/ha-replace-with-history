@@ -48,13 +48,6 @@ def run_statistics_analysis(
     if new_total_like:
         state_reset_rows.extend(collect_reset_events_states(conn, new_entity_id))
 
-    if state_reset_rows:
-        print("State reset events report:")
-        state_reset_rows.sort(key=lambda r: float(r.get("event_epoch", "inf") or "inf"))
-        headers = ["entity", "table", "before", "after"]
-        rows = [[r["entity"], r["table"], r["before"], r["after"]] for r in state_reset_rows]
-        print(render_simple_table(headers=headers, rows=rows, color=color, color_code="35"), end="")
-
     stats_reset_rows: list[dict[str, str]] = []
     if old_total_like:
         stats_reset_rows.extend(collect_reset_events_statistics(conn, "statistics", old_entity_id))
@@ -63,12 +56,33 @@ def run_statistics_analysis(
         stats_reset_rows.extend(collect_reset_events_statistics(conn, "statistics", new_entity_id))
         stats_reset_rows.extend(collect_reset_events_statistics(conn, "statistics_short_term", new_entity_id))
 
-    if stats_reset_rows:
-        print("Statistics reset events report:")
-        stats_reset_rows.sort(key=lambda r: float(r.get("event_epoch", "inf") or "inf"))
-        headers = ["entity", "table", "last_reset", "before", "after"]
-        rows = [[r["entity"], r["table"], r.get("last_reset", ""), r["before"], r["after"]] for r in stats_reset_rows]
-        print(render_simple_table(headers=headers, rows=rows, color=color, color_code="35"), end="")
+    # Print two combined reset tables:
+    # 1) states + statistics
+    # 2) states + statistics_short_term
+    if state_reset_rows or stats_reset_rows:
+        stats_rows = [r for r in stats_reset_rows if r.get("table") == "statistics"]
+        st_rows = [r for r in stats_reset_rows if r.get("table") == "statistics_short_term"]
+
+        def print_combined(title: str, combined: list[dict[str, str]]) -> None:
+            if not combined:
+                return
+            print(title)
+            combined.sort(key=lambda r: float(r.get("event_epoch", "inf") or "inf"))
+            headers = ["entity", "table", "before", "after", "last_reset"]
+            rows = [
+                [r["entity"], r["table"], r["before"], r["after"], r.get("last_reset", "")]
+                for r in combined
+            ]
+            print(render_simple_table(headers=headers, rows=rows, color=color, color_code="35"), end="")
+
+        print_combined(
+            "Reset events report (states + statistics):",
+            [*state_reset_rows, *stats_rows],
+        )
+        print_combined(
+            "Reset events report (states + statistics_short_term):",
+            [*state_reset_rows, *st_rows],
+        )
 
     gap_rows: list[dict[str, str]] = []
     for entity_id in (old_entity_id, new_entity_id):
