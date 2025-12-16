@@ -46,8 +46,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=True,
         metavar="{true|false}",
         help=(
-            "Stage 4 only: if true (default), treat the new entity as having restarted from 0 at first sample, "
-            "so the first generated sum increases by the full first reading; if false, keep current behavior."
+            "If true (default), treat the first reading as a restart from 0; if false, don't add it to the first sum."
         ),
     )
 
@@ -55,8 +54,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--apply",
         action="store_true",
         help=(
-            "Stage 4 only: execute the generated update SQL against --db and commit the changes. "
-            "(The SQL file is still written for review.)"
+            "Execute the generated update SQL against --db and commit changes (still writes update.sql)."
         ),
     )
 
