@@ -228,13 +228,21 @@ class TestStage3StatisticsSimulation(unittest.TestCase):
                 new_entity_started_from_0=True,
             )
 
-            # Generated rows should include last_reset for at least one bucket.
+            # Legacy last_reset should be NULL when last_reset_ts exists.
             row = ro.execute(
                 "SELECT last_reset FROM statistics_generated WHERE statistic_id = ? AND start_ts > 0 ORDER BY start_ts ASC LIMIT 1",
                 ("sensor.new",),
             ).fetchone()
             self.assertIsNotNone(row)
-            self.assertIsNotNone(row[0])
+            self.assertIsNone(row[0])
+
+            # last_reset_ts should be populated.
+            row2 = ro.execute(
+                "SELECT last_reset_ts FROM statistics_generated WHERE statistic_id = ? AND start_ts > 0 ORDER BY start_ts ASC LIMIT 1",
+                ("sensor.new",),
+            ).fetchone()
+            self.assertIsNotNone(row2)
+            self.assertIsNotNone(row2[0])
 
             script = build_statistics_update_sql_script(
                 ro,
@@ -340,12 +348,15 @@ class TestStage3StatisticsSimulation(unittest.TestCase):
                 ],
             )
 
-            # New entity states start later, so stage3 will generate a bucket at 10800.
+            # New entity states start later. To consider the 10800 bucket complete,
+            # include at least one state in the following bucket (14400), which will
+            # itself be excluded as the last/in-progress bucket.
             conn.executemany(
                 "INSERT INTO states(entity_id, state, last_updated_ts) VALUES(?,?,?)",
                 [
                     ("sensor.new", "30", 11000.0),
                     ("sensor.new", "31", 11100.0),
+                    ("sensor.new", "32", 14500.0),
                 ],
             )
             conn.commit()
@@ -398,10 +409,11 @@ class TestStage3StatisticsSimulation(unittest.TestCase):
                 ],
             )
 
-            # Create 7 generated buckets: 10800 .. 32400.
+            # Create 8 buckets worth of states so that after excluding the last
+            # in-progress bucket we still have 7 generated buckets: 10800 .. 32400.
             states = []
             v = 30
-            for t in (11000.0, 14600.0, 18200.0, 21800.0, 25400.0, 29000.0, 32600.0):
+            for t in (11000.0, 14600.0, 18200.0, 21800.0, 25400.0, 29000.0, 32600.0, 36200.0):
                 states.append(("sensor.new", str(v), t))
                 v += 1
             conn.executemany(
@@ -609,12 +621,14 @@ class TestStage3StatisticsSimulation(unittest.TestCase):
             )
 
             # New entity values within bucket 10800: 1, 3, 5 => min=1, mean=3, max=5; last state=5.
+            # Add one state in the next bucket (14400) to mark 10800 as complete.
             conn.executemany(
                 "INSERT INTO states(entity_id, state, last_updated_ts) VALUES(?,?,?)",
                 [
                     ("sensor.new", "1", 11000.0),
                     ("sensor.new", "3", 11100.0),
                     ("sensor.new", "5", 11200.0),
+                    ("sensor.new", "6", 14500.0),
                 ],
             )
             conn.commit()
@@ -717,7 +731,8 @@ class TestStage3StatisticsSimulation(unittest.TestCase):
                 "SELECT start_ts, state, sum FROM statistics WHERE statistic_id = ? ORDER BY start_ts",
                 ("sensor.new",),
             ).fetchall()
-            self.assertEqual([r["start_ts"] for r in rows], [0.0, 3600.0, 10800.0, 14400.0])
+            # Last in-progress bucket is excluded, so only the complete generated bucket remains.
+            self.assertEqual([r["start_ts"] for r in rows], [0.0, 3600.0, 10800.0])
             # Copied row at 0.0 should match old's 0.0 state/sum, not the old pre-existing new row.
             self.assertEqual((rows[0]["state"], rows[0]["sum"]), (10.0, 100.0))
         finally:

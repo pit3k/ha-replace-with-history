@@ -956,8 +956,24 @@ def build_statistics_generated_view_sql(
 
     stats_state_sel = "t.state" if "state" in s_cols else "NULL"
     stats_sum_sel = "t.sum" if "sum" in s_cols else "NULL"
-    stats_last_reset_sel = "t.last_reset" if "last_reset" in s_cols else "NULL"
-    stats_last_reset_ts_sel = "t.last_reset_ts" if "last_reset_ts" in s_cols else "NULL"
+    # If the DB supports modern last_reset_ts, keep legacy last_reset NULL.
+    # (HA no longer uses the legacy text last_reset column; we only persist *_ts.)
+    stats_has_last_reset_ts = "last_reset_ts" in s_cols
+    stats_last_reset_sel = (
+        "NULL"
+        if ("last_reset" in s_cols and stats_has_last_reset_ts)
+        else ("t.last_reset" if "last_reset" in s_cols else "NULL")
+    )
+    stats_last_reset_ts_sel = (
+        "t.last_reset_ts"
+        if stats_has_last_reset_ts
+        else (
+            "CASE WHEN t.last_reset IS NULL OR TRIM(CAST(t.last_reset AS TEXT)) = '' "
+            "THEN NULL ELSE CAST(strftime('%s', replace(substr(CAST(t.last_reset AS TEXT), 1, 19), 'T', ' ')) AS REAL) END"
+            if "last_reset" in s_cols
+            else "NULL"
+        )
+    )
     stats_mean_sel = "t.mean" if "mean" in s_cols else "NULL"
     stats_min_sel = "t.min" if "min" in s_cols else "NULL"
     stats_max_sel = "t.max" if "max" in s_cols else "NULL"
@@ -994,9 +1010,12 @@ new_stats AS (
         NULL AS max
     FROM bucket_last
     WHERE rn = 1
+      AND start_ts < (SELECT cutoff_bucket FROM cutoff)
 )
 """.strip()
     elif statistics_kind == "total":
+        out_last_reset = "NULL" if stats_has_last_reset_ts else "last_reset"
+        out_last_reset_ts = "last_reset_ts" if stats_has_last_reset_ts else "NULL"
         new_stats_cte = f"""
 new_stats AS (
     SELECT
@@ -1005,13 +1024,14 @@ new_stats AS (
         start_ts,
         state,
         sum,
-        last_reset,
-        last_reset_ts,
+        {out_last_reset} AS last_reset,
+        {out_last_reset_ts} AS last_reset_ts,
         NULL AS mean,
         NULL AS min,
         NULL AS max
     FROM bucket_last
     WHERE rn = 1
+      AND start_ts < (SELECT cutoff_bucket FROM cutoff)
 )
 """.strip()
     else:
@@ -1047,6 +1067,7 @@ new_stats AS (
     FROM bucket_aggs a
     JOIN bucket_last2 l ON l.start_ts = a.start_ts
     WHERE l.rn = 1
+      AND a.start_ts < (SELECT cutoff_bucket FROM cutoff)
 )
 """.strip()
 
@@ -1109,6 +1130,14 @@ num_states AS (
     WHERE raw_state IS NOT NULL
         AND TRIM(CAST(raw_state AS TEXT)) <> ''
         AND LOWER(TRIM(CAST(raw_state AS TEXT))) NOT IN ('unavailable','unknown')
+),
+states_max AS (
+    SELECT MAX(ts) AS max_ts FROM num_states
+),
+cutoff AS (
+    -- Exclude the bucket containing the latest state (it's still in-progress).
+    -- If max_ts is NULL, cutoff_bucket is NULL and no generated rows are produced.
+    SELECT CAST(max_ts / {interval_seconds} AS INT) * {interval_seconds} AS cutoff_bucket FROM states_max
 ),
 deltas AS (
     SELECT
@@ -1385,6 +1414,229 @@ def collect_generated_statistics_preview_rows(
     out.append({"ts": "...", "state": "...", "sum": "...", "mean": "...", "min": "...", "max": "..."})
     out.extend([fmt_row(r) for r in gen_last])
     return out
+
+
+def snapshot_statistics_rows(
+    conn: sqlite3.Connection,
+    table: str,
+    statistic_id: str,
+    *,
+    start_epoch_gt: float | None = None,
+) -> tuple[str | None, bool, dict[float, dict[str, Any]]]:
+    """Snapshot rows for a statistic_id keyed by start timestamp (epoch seconds).
+
+    Returns: (ts_column_name, ts_is_seconds, {start_epoch: row_dict}).
+    """
+    if not _table_exists(conn, table):
+        return None, True, {}
+
+    cols = _columns(conn, table)
+    ts_col = _pick_first_present(cols, ["start_ts", "start"])
+    if ts_col is None:
+        return None, True, {}
+    ts_is_seconds = ts_col.endswith("_ts")
+
+    # Build FROM/WHERE for both schema variants.
+    if "metadata_id" in cols and _table_exists(conn, "statistics_meta"):
+        meta_cols = _columns(conn, "statistics_meta")
+        if not ("statistic_id" in meta_cols and "id" in meta_cols):
+            return ts_col, ts_is_seconds, {}
+        from_sql = f"{table} t JOIN statistics_meta m ON m.id = t.metadata_id"
+        where_sql = "m.statistic_id = ?"
+        params = (statistic_id,)
+        select_cols = [f"t.{c} AS {c}" for c in cols]
+        select_cols.append("m.statistic_id AS statistic_id")
+    elif "statistic_id" in cols:
+        from_sql = f"{table} t"
+        where_sql = "t.statistic_id = ?"
+        params = (statistic_id,)
+        select_cols = [f"t.{c} AS {c}" for c in cols]
+    else:
+        return ts_col, ts_is_seconds, {}
+
+    rows = conn.execute(
+        f"SELECT {', '.join(select_cols)} FROM {from_sql} WHERE {where_sql} ORDER BY t.{ts_col} ASC",
+        params,
+    ).fetchall()
+
+    out: dict[float, dict[str, Any]] = {}
+    for r in rows:
+        start_epoch = _to_epoch_seconds(r[ts_col], assume_seconds=ts_is_seconds)
+        if start_epoch is None:
+            continue
+        if start_epoch_gt is not None and float(start_epoch) <= float(start_epoch_gt):
+            continue
+        row_dict: dict[str, Any] = {k: r[k] for k in r.keys()}
+        out[float(start_epoch)] = row_dict
+
+    return ts_col, ts_is_seconds, out
+
+
+def build_statistics_change_report(
+    *,
+    before: dict[float, dict[str, Any]],
+    after: dict[float, dict[str, Any]],
+    before_ts_col: str,
+    before_ts_is_seconds: bool,
+    after_ts_col: str,
+    after_ts_is_seconds: bool,
+) -> tuple[list[str], list[list[str]]]:
+    """Build a Stage 5 diff report.
+
+    - Align rows by start timestamp.
+    - First column is start_dt.
+    - For each differing column (excluding id and timestamp columns):
+      - same => empty cell
+      - old+new => "old -> new"
+      - only new => "(none) -> new"
+      - only old => "old -> (none)"
+    """
+
+    def norm_for_compare(col: str, v: Any) -> Any:
+        if v is None:
+            return None
+        # Align comparison precision with display for timestamp columns.
+        # `_fmt_ts()` renders to whole seconds, so treat values within the same second as equal.
+        if col.endswith("_ts"):
+            try:
+                return int(float(v))
+            except Exception:
+                return str(v)
+        if isinstance(v, (int, float)):
+            return float(v)
+        if isinstance(v, str):
+            return v
+        return str(v)
+
+    def _try_float(v: Any) -> float | None:
+        if v is None:
+            return None
+        try:
+            return float(v)
+        except Exception:
+            return None
+
+    def _fmt_num(x: float) -> str:
+        # Keep stable, human-friendly formatting.
+        s = f"{x:.6f}".rstrip("0").rstrip(".")
+        return s if s else "0"
+
+    def _fmt_delta(delta: float) -> str:
+        return ("+" if delta >= 0 else "-") + _fmt_num(abs(delta))
+
+    def fmt_value(col: str, v: Any) -> str:
+        if v is None:
+            return "(none)"
+        # Render *_ts columns as local timestamps when numeric.
+        if col.endswith("_ts"):
+            try:
+                return _fmt_ts(float(v), assume_seconds=True) or str(v)
+            except Exception:
+                return str(v)
+        return str(v)
+
+    def fmt_cell(col: str, bv: Any, av: Any) -> str:
+        base = f"{fmt_value(col, bv)} -> {fmt_value(col, av)}"
+        # Add delta for numeric non-timestamp columns when both sides exist.
+        if not col.endswith("_ts"):
+            bnum = _try_float(bv)
+            anum = _try_float(av)
+            if bnum is not None and anum is not None:
+                return f"{base} ({_fmt_delta(anum - bnum)})"
+        return base
+
+    keys = sorted(set(before.keys()) | set(after.keys()))
+
+    exclude = {"id", before_ts_col, after_ts_col}
+    # These are constant/boring for a single statistic_id; keep them out of the report.
+    exclude |= {"statistic_id", "metadata_id"}
+
+    candidate_cols: set[str] = set()
+    for m in (before, after):
+        for row in m.values():
+            candidate_cols.update(row.keys())
+    candidate_cols -= exclude
+
+    # Only include columns that actually differ in at least one row.
+    diff_cols: list[str] = []
+    for col in sorted(candidate_cols):
+        differs = False
+        for k in keys:
+            b = before.get(k)
+            a = after.get(k)
+            bv = None if b is None else b.get(col)
+            av = None if a is None else a.get(col)
+            if norm_for_compare(col, bv) != norm_for_compare(col, av):
+                differs = True
+                break
+        if differs:
+            diff_cols.append(col)
+
+    headers = ["start_dt", *diff_cols]
+    rows_out: list[list[str]] = []
+
+    for k in keys:
+        start_dt = _fmt_ts(k, assume_seconds=True) or str(k)
+        row_cells: list[str] = [start_dt]
+
+        b = before.get(k)
+        a = after.get(k)
+
+        any_diff = False
+        for col in diff_cols:
+            bv = None if b is None else b.get(col)
+            av = None if a is None else a.get(col)
+            if norm_for_compare(col, bv) == norm_for_compare(col, av):
+                row_cells.append("")
+            else:
+                any_diff = True
+                row_cells.append(fmt_cell(col, bv, av))
+
+        if any_diff:
+            rows_out.append(row_cells)
+
+    return headers, rows_out
+
+
+def build_statistics_change_report_with_epochs(
+    *,
+    before: dict[float, dict[str, Any]],
+    after: dict[float, dict[str, Any]],
+    before_ts_col: str,
+    before_ts_is_seconds: bool,
+    after_ts_col: str,
+    after_ts_is_seconds: bool,
+) -> tuple[list[str], list[tuple[float, list[str]]]]:
+    """Like build_statistics_change_report, but returns (start_epoch, row_cells) per row.
+
+    Intended for Stage 4 to condense output by contiguous time ranges.
+    """
+
+    headers, rows = build_statistics_change_report(
+        before=before,
+        after=after,
+        before_ts_col=before_ts_col,
+        before_ts_is_seconds=before_ts_is_seconds,
+        after_ts_col=after_ts_col,
+        after_ts_is_seconds=after_ts_is_seconds,
+    )
+
+    # Rebuild the epoch list in the same order as rows, based on the union of keys.
+    # This is safe because build_statistics_change_report iterates keys sorted.
+    keys = sorted(set(before.keys()) | set(after.keys()))
+    # Filter keys to those that actually differ.
+    key_iter = iter(keys)
+    out: list[tuple[float, list[str]]] = []
+    for row in rows:
+        # Advance until we find a key whose formatted start_dt matches.
+        # (Rows are already in key order; this is a linear walk.)
+        while True:
+            k = next(key_iter)
+            start_dt = _fmt_ts(k, assume_seconds=True) or str(k)
+            if start_dt == row[0]:
+                out.append((k, row))
+                break
+    return headers, out
 
 
 def collect_reset_events_states(

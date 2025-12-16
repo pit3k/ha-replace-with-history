@@ -3,13 +3,16 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import cast
 
 from ha_replace_with_history.db_summary import (
+    build_statistics_change_report,
     collect_last_reset_rows,
     collect_missing_statistics_row_ranges,
     collect_reset_events_statistics,
     collect_reset_events_states,
     connect_readonly_sqlite,
+    snapshot_statistics_rows,
     summarize_all,
     summarize_statistics,
     summarize_states,
@@ -503,6 +506,100 @@ class TestStage2DbSummary(unittest.TestCase):
         self.assertEqual(resets[0]["before"], f"{self._fmt_local(200.0)} (110)")
         self.assertEqual(resets[0]["after"], f"{self._fmt_local(300.0)} (5)")
         self.assertIn("2025", resets[0].get("last_reset", ""))
+
+    def test_stage5_statistics_change_report(self) -> None:
+        db_path = self._make_db()
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute(
+                "CREATE TABLE statistics (id INTEGER PRIMARY KEY, statistic_id TEXT, start_ts REAL, state REAL, sum REAL, created_ts REAL)"
+            )
+
+            # Before snapshot:
+            # - 0 exists and will change state
+            # - 3600 exists and will be deleted
+            conn.executemany(
+                "INSERT INTO statistics(statistic_id, start_ts, state, sum, created_ts) VALUES(?,?,?,?,?)",
+                [
+                    ("sensor.new", 0.0, 1.0, 10.0, 1.0),
+                    ("sensor.new", 3600.0, 2.0, 20.0, 2.0),
+                ],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        ro = connect_readonly_sqlite(db_path)
+        try:
+            before = snapshot_statistics_rows(ro, "statistics", "sensor.new")
+        finally:
+            ro.close()
+
+        # Mutate DB to represent "after apply".
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute("DELETE FROM statistics WHERE statistic_id = ?", ("sensor.new",))
+            conn.executemany(
+                "INSERT INTO statistics(statistic_id, start_ts, state, sum, created_ts) VALUES(?,?,?,?,?)",
+                [
+                    ("sensor.new", 0.0, 1.5, 10.0, 3.0),  # state + created_ts changed
+                    ("sensor.new", 7200.0, 3.0, 30.0, 4.0),  # new row
+                ],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        ro = connect_readonly_sqlite(db_path)
+        try:
+            after = snapshot_statistics_rows(ro, "statistics", "sensor.new")
+        finally:
+            ro.close()
+
+        b_ts_col, b_ts_sec, b_rows = before
+        a_ts_col, a_ts_sec, a_rows = after
+        self.assertIsNotNone(b_ts_col)
+        self.assertIsNotNone(a_ts_col)
+        b_ts_col_s = cast(str, b_ts_col)
+        a_ts_col_s = cast(str, a_ts_col)
+        self.assertEqual(b_ts_col_s, "start_ts")
+        self.assertEqual(a_ts_col_s, "start_ts")
+
+        headers, rows = build_statistics_change_report(
+            before=b_rows,
+            after=a_rows,
+            before_ts_col=b_ts_col_s,
+            before_ts_is_seconds=b_ts_sec,
+            after_ts_col=a_ts_col_s,
+            after_ts_is_seconds=a_ts_sec,
+        )
+
+        # Expect columns for state + created_ts + sum (sum differs due to inserted/deleted rows).
+        self.assertEqual(headers[0], "start_dt")
+        self.assertIn("state", headers)
+        self.assertIn("created_ts", headers)
+        self.assertIn("sum", headers)
+
+        # Rows should include timestamps for: 0, 3600 (deleted), 7200 (inserted)
+        self.assertEqual(len(rows), 3)
+        by_dt = {r[0]: r for r in rows}
+        r0 = by_dt[self._fmt_local(0.0)]
+        r3600 = by_dt[self._fmt_local(3600.0)]
+        r7200 = by_dt[self._fmt_local(7200.0)]
+
+        state_idx = headers.index("state")
+        created_idx = headers.index("created_ts")
+        sum_idx = headers.index("sum")
+
+        self.assertEqual(r0[state_idx], "1.0 -> 1.5 (+0.5)")
+        self.assertTrue(r0[created_idx].startswith(self._fmt_local(1.0)))
+        self.assertTrue(r0[created_idx].endswith(self._fmt_local(3.0)))
+        self.assertEqual(r0[sum_idx], "")
+
+        self.assertEqual(r3600[state_idx], "2.0 -> (none)")
+        self.assertEqual(r3600[sum_idx], "20.0 -> (none)")
+        self.assertEqual(r7200[state_idx], "(none) -> 3.0")
+        self.assertEqual(r7200[sum_idx], "(none) -> 30.0")
 
     def test_total_resets_use_last_reset_change_in_statistics(self) -> None:
         db_path = self._make_db()

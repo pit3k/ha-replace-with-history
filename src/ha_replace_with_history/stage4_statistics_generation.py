@@ -7,13 +7,17 @@ from pathlib import Path
 from .db_summary import (
     DbSummaryError,
     apply_sql_script,
+    build_statistics_change_report,
+    build_statistics_change_report_with_epochs,
     build_statistics_update_sql_script,
     collect_generated_statistics_preview_rows,
     collect_missing_statistics_row_ranges,
     collect_reset_events_statistics,
+    connect_readonly_sqlite,
     create_statistics_generated_view,
     get_earliest_state_ts_epoch,
     get_latest_statistics_ts_epoch,
+    snapshot_statistics_rows,
 )
 from .report import render_simple_table
 
@@ -73,6 +77,11 @@ def run_statistics_generation(
         print("Stage 4 skipped: precondition failed (new states earliest must be after old statistics latest).")
         return Stage4Result(ran=False, sql_path=None)
 
+    # Stage 5 diffs should only consider newly generated rows (based on new entity states),
+    # excluding the portion copied from the old entity statistics.
+    cutoff_long = old_stats_latest
+    cutoff_short = old_stats_st_latest
+
     try:
         create_statistics_generated_view(
             conn,
@@ -98,6 +107,95 @@ def run_statistics_generation(
         print(f"Stage 4 skipped: {exc}")
         return Stage4Result(ran=False, sql_path=None)
 
+    def _condense_epoch_rows(
+        headers: list[str],
+        epoch_rows: list[tuple[float, list[str]]],
+        *,
+        interval_seconds: int,
+    ) -> list[list[str]]:
+        if not epoch_rows:
+            return []
+
+        def is_contiguous(prev_epoch: float, next_epoch: float) -> bool:
+            return abs((next_epoch - prev_epoch) - float(interval_seconds)) < 1e-6
+
+        blocks: list[list[tuple[float, list[str]]]] = []
+        cur: list[tuple[float, list[str]]] = [epoch_rows[0]]
+        for e, r in epoch_rows[1:]:
+            prev_e = cur[-1][0]
+            if is_contiguous(prev_e, e):
+                cur.append((e, r))
+            else:
+                blocks.append(cur)
+                cur = [(e, r)]
+        blocks.append(cur)
+
+        out: list[list[str]] = []
+        dots_row = ["..."] + ["..."] * (len(headers) - 1)
+
+        for b in blocks:
+            if len(b) <= 6:
+                out.extend([r for _, r in b])
+                continue
+            out.extend([r for _, r in b[:3]])
+            out.append(dots_row)
+            out.extend([r for _, r in b[-3:]])
+        return out
+
+    def format_diff_condensed(
+        title: str,
+        before_snap,
+        after_snap,
+        *,
+        interval_seconds: int,
+        code: str,
+    ) -> str:
+        b_ts_col, b_ts_is_sec, b_rows = before_snap
+        a_ts_col, a_ts_is_sec, a_rows = after_snap
+        if not b_rows and not a_rows:
+            return ""
+        if b_ts_col is None or a_ts_col is None:
+            return ""
+
+        headers, epoch_rows = build_statistics_change_report_with_epochs(
+            before=b_rows,
+            after=a_rows,
+            before_ts_col=b_ts_col,
+            before_ts_is_seconds=b_ts_is_sec,
+            after_ts_col=a_ts_col,
+            after_ts_is_seconds=a_ts_is_sec,
+        )
+        if len(headers) <= 1 or not epoch_rows:
+            return ""
+        condensed_rows = _condense_epoch_rows(headers, epoch_rows, interval_seconds=interval_seconds)
+        if not condensed_rows:
+            return ""
+        return title + "\n" + render_simple_table(headers=headers, rows=condensed_rows, color=color, color_code=code)
+
+    # Stage 5 (dry-run): compare current rows (would be deleted) vs generated rows (would be inserted).
+    # This runs even without --apply.
+    before_long_dry = snapshot_statistics_rows(conn, "statistics", new_entity_id, start_epoch_gt=cutoff_long)
+    after_long_dry = snapshot_statistics_rows(conn, generated_stats_view, new_entity_id, start_epoch_gt=cutoff_long)
+    before_short_dry = snapshot_statistics_rows(
+        conn, "statistics_short_term", new_entity_id, start_epoch_gt=cutoff_short
+    )
+    after_short_dry = snapshot_statistics_rows(conn, generated_st_view, new_entity_id, start_epoch_gt=cutoff_short)
+
+    planned_stage5_long = format_diff_condensed(
+        "Statistics changes (long-term):",
+        before_long_dry,
+        after_long_dry,
+        interval_seconds=3600,
+        code="33",
+    )
+    planned_stage5_short = format_diff_condensed(
+        "Statistics changes (short-term):",
+        before_short_dry,
+        after_short_dry,
+        interval_seconds=300,
+        code="33",
+    )
+
     sql_path = Path.cwd() / "update.sql"
     sql_script = build_statistics_update_sql_script(
         conn,
@@ -111,13 +209,53 @@ def run_statistics_generation(
     sql_path.write_text(sql_script, encoding="utf-8")
     print(f"Stage 4 update SQL written: {sql_path}")
 
+    applied_ok = False
+    before_long: tuple[str | None, bool, dict[float, dict[str, object]]] | None = None
+    before_short: tuple[str | None, bool, dict[float, dict[str, object]]] | None = None
+    applied_stage5 = ""
     if apply:
+        # Snapshot pre-apply rows for Stage 5.
+        before_long = snapshot_statistics_rows(conn, "statistics", new_entity_id, start_epoch_gt=cutoff_long)
+        before_short = snapshot_statistics_rows(
+            conn, "statistics_short_term", new_entity_id, start_epoch_gt=cutoff_short
+        )
+
         try:
             apply_sql_script(db_path, sql_script)
         except Exception as exc:
             print(f"Stage 4 apply failed: {exc}")
         else:
+            applied_ok = True
             print(f"Stage 4 apply succeeded: updated {db_path}")
+
+    if applied_ok and before_long is not None:
+        after_conn = connect_readonly_sqlite(db_path)
+        try:
+            after_long = snapshot_statistics_rows(after_conn, "statistics", new_entity_id, start_epoch_gt=cutoff_long)
+            after_short = snapshot_statistics_rows(
+                after_conn, "statistics_short_term", new_entity_id, start_epoch_gt=cutoff_short
+            )
+        finally:
+            after_conn.close()
+
+        applied_stage5_long = format_diff_condensed(
+            "Statistics changes (long-term):",
+            before_long,
+            after_long,
+            interval_seconds=3600,
+            code="33",
+        )
+        applied_stage5_short = ""
+        if before_short is not None:
+            applied_stage5_short = format_diff_condensed(
+                "Statistics changes (short-term):",
+                before_short,
+                after_short,
+                interval_seconds=300,
+                code="33",
+            )
+
+        applied_stage5 = "".join([applied_stage5_long, applied_stage5_short])
 
     # Generated statistics analysis
     reset_rows: list[dict[str, str]] = []
@@ -216,5 +354,16 @@ def run_statistics_generation(
 
     _print_preview("=== GENERATED PREVIEW: statistics ===", stats_preview)
     _print_preview("=== GENERATED PREVIEW: statistics_short_term ===", st_preview)
+
+    # Print Stage 5 reports last.
+    if planned_stage5_long or planned_stage5_short:
+        print("*** Stage 5: Planned statistics diff")
+        if planned_stage5_long:
+            print(planned_stage5_long, end="")
+        if planned_stage5_short:
+            print(planned_stage5_short, end="")
+    if applied_stage5:
+        print("*** Stage 5: Applied statistics diff")
+        print(applied_stage5, end="")
 
     return Stage4Result(ran=True, sql_path=sql_path)
